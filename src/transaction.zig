@@ -75,8 +75,118 @@ pub const ChildSpanOpts = struct {
 };
 
 pub const TransactionOrSpan = union(enum) {
-    transaction: *const Transaction,
-    span: *const Span,
+    transaction: *Transaction,
+    span: *Span,
+
+    pub fn setData(self: TransactionOrSpan, key: []const u8, value: json.Value) !void {
+        switch (self) {
+            .transaction => |transaction| try transaction.setData(key, value),
+            .span => |span| try span.setData(key, value),
+        }
+    }
+
+    pub fn setTag(self: TransactionOrSpan, key: []const u8, value: []const u8) !void {
+        switch (self) {
+            .transaction => |transaction| try transaction.setTag(key, value),
+            .span => |span| try span.setTag(key, value),
+        }
+    }
+
+    pub fn getTraceContext(self: TransactionOrSpan) TraceContext {
+        return switch (self) {
+            .transaction => |transaction| transaction.getTraceContext(),
+            .span => |span| span.getTraceContext(),
+        };
+    }
+
+    pub fn getStatus(self: TransactionOrSpan) ?SpanStatus {
+        return switch (self) {
+            .transaction => |transaction| transaction.getStatus(),
+            .span => |span| span.getStatus(),
+        };
+    }
+
+    pub fn setStatus(self: TransactionOrSpan, status: SpanStatus) void {
+        switch (self) {
+            .transaction => |transaction| transaction.setStatus(status),
+            .span => |span| span.setStatus(status),
+        }
+    }
+
+    pub fn setOp(self: TransactionOrSpan, op: ?[]const u8) void {
+        switch (self) {
+            .transaction => |transaction| transaction.setOp(op),
+            .span => |span| span.setOp(op),
+        }
+    }
+
+    pub fn setName(self: TransactionOrSpan, name: []const u8) void {
+        switch (self) {
+            .transaction => |transaction| transaction.setName(name),
+            .span => |span| span.setName(name),
+        }
+    }
+
+    pub fn setRequest(self: TransactionOrSpan, request: Request) !void {
+        switch (self) {
+            .transaction => |transaction| try transaction.setRequest(request),
+            .span => |span| try span.setRequest(request),
+        }
+    }
+
+    pub fn sentryTraceHeaderAlloc(self: TransactionOrSpan, allocator: Allocator) ![]u8 {
+        return switch (self) {
+            .transaction => |transaction| transaction.sentryTraceHeaderAlloc(allocator),
+            .span => |span| span.sentryTraceHeaderAlloc(allocator),
+        };
+    }
+
+    pub fn isSampled(self: TransactionOrSpan) bool {
+        return switch (self) {
+            .transaction => |transaction| transaction.isSampled(),
+            .span => |span| span.isSampled(),
+        };
+    }
+
+    pub fn startChild(self: TransactionOrSpan, opts: ChildSpanOpts) !*Span {
+        return switch (self) {
+            .transaction => |transaction| transaction.startChild(opts),
+            .span => |span| span.startChild(opts),
+        };
+    }
+
+    pub fn startChildWithDetails(
+        self: TransactionOrSpan,
+        opts: ChildSpanOpts,
+        span_id: SpanId,
+        start_timestamp: f64,
+    ) !*Span {
+        return switch (self) {
+            .transaction => |transaction| transaction.startChildWithDetails(opts, span_id, start_timestamp),
+            .span => |span| span.startChildWithDetails(opts, span_id, start_timestamp),
+        };
+    }
+
+    pub fn getSpanId(self: TransactionOrSpan) SpanId {
+        return switch (self) {
+            .transaction => |transaction| transaction.span_id,
+            .span => |span| span.getSpanId(),
+        };
+    }
+
+    pub fn finishWithTimestamp(self: TransactionOrSpan, timestamp: f64) void {
+        switch (self) {
+            .transaction => |transaction| transaction.finishWithTimestamp(timestamp),
+            .span => |span| span.finishWithTimestamp(timestamp),
+        }
+    }
+
+    pub fn finish(self: TransactionOrSpan) void {
+        switch (self) {
+            .transaction => |transaction| transaction.finish(),
+            .span => |span| span.finish(),
+        }
+    }
 };
 
 pub const TraceContext = struct {
@@ -1120,4 +1230,90 @@ test "Span setRequest stores request details in span data" {
     try testing.expect(std.mem.indexOf(u8, json_str, "\"method\":\"POST\"") != null);
     try testing.expect(std.mem.indexOf(u8, json_str, "\"url\":\"https://api.example.com/checkout\"") != null);
     try testing.expect(std.mem.indexOf(u8, json_str, "\"data\":\"{\\\"amount\\\":42}\"") != null);
+}
+
+test "TransactionOrSpan delegates mutating APIs to transaction" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /tos-transaction",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    var tos: TransactionOrSpan = .{ .transaction = &txn };
+    try tos.setTag("flow", "checkout");
+    try tos.setData("cache_hit", .{ .bool = true });
+    tos.setStatus(.ok);
+    tos.setOp("http.server.processed");
+    tos.setName("GET /tos-transaction-renamed");
+    try tos.setRequest(.{
+        .method = "GET",
+        .url = "https://example.com/orders",
+    });
+    try testing.expectEqual(@as(?SpanStatus, .ok), tos.getStatus());
+    try testing.expect(tos.isSampled());
+
+    const trace_ctx = tos.getTraceContext();
+    try testing.expectEqualSlices(u8, txn.trace_id[0..], trace_ctx.trace_id[0..]);
+    try testing.expectEqualSlices(u8, txn.span_id[0..], tos.getSpanId()[0..]);
+
+    var child = try tos.startChild(.{ .op = "db.query", .description = "SELECT 1" });
+    try child.setTag("db.system", "postgresql");
+    child.finish();
+
+    tos.finish();
+    const json_str = try txn.toJson(testing.allocator);
+    defer testing.allocator.free(json_str);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"flow\":\"checkout\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"cache_hit\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"transaction\":\"GET /tos-transaction-renamed\"") != null);
+}
+
+test "TransactionOrSpan delegates mutating APIs to span" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /tos-span",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const root = try txn.startChild(.{ .op = "db.root" });
+    var tos: TransactionOrSpan = .{ .span = root };
+    try tos.setTag("db.system", "postgresql");
+    try tos.setData("rows", .{ .integer = 7 });
+    tos.setStatus(.ok);
+    tos.setOp("db.root.processed");
+    tos.setName("root span");
+    try tos.setRequest(.{
+        .method = "POST",
+        .url = "https://db.example.com/query",
+    });
+    try testing.expectEqual(@as(?SpanStatus, .ok), tos.getStatus());
+    try testing.expect(tos.isSampled());
+
+    const trace_ctx = tos.getTraceContext();
+    try testing.expectEqualSlices(u8, txn.trace_id[0..], trace_ctx.trace_id[0..]);
+    try testing.expectEqualSlices(u8, root.span_id[0..], tos.getSpanId()[0..]);
+
+    const nested_id: SpanId = "89abcdef01234567".*;
+    const nested = try tos.startChildWithDetails(
+        .{ .op = "db.nested", .description = "SELECT 2" },
+        nested_id,
+        1704067204.125,
+    );
+    try testing.expectEqualSlices(u8, nested_id[0..], nested.span_id[0..]);
+    try testing.expectEqualSlices(u8, root.span_id[0..], nested.parent_span_id.?[0..]);
+
+    const sentry_trace = try tos.sentryTraceHeaderAlloc(testing.allocator);
+    defer testing.allocator.free(sentry_trace);
+    try testing.expect(std.mem.indexOf(u8, sentry_trace, txn.trace_id[0..]) != null);
+    try testing.expect(std.mem.indexOf(u8, sentry_trace, root.span_id[0..]) != null);
+
+    tos.finishWithTimestamp(1704067204.500);
+    try testing.expectEqual(@as(?f64, 1704067204.500), root.timestamp);
+
+    txn.finish();
+    const json_str = try txn.toJson(testing.allocator);
+    defer testing.allocator.free(json_str);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"db.system\":\"postgresql\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"rows\":7") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"description\":\"root span\"") != null);
 }
