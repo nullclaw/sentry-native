@@ -12,6 +12,7 @@ const Attachment = @import("attachment.zig").Attachment;
 const Uuid = @import("uuid.zig").Uuid;
 const ts = @import("timestamp.zig");
 const propagation = @import("propagation.zig");
+const envelope = @import("envelope.zig");
 
 pub const MAX_BREADCRUMBS = 200;
 pub const EventProcessor = *const fn (*Event) bool;
@@ -134,6 +135,23 @@ fn upsertOwnedObjectEntry(allocator: Allocator, obj: *json.ObjectMap, key: []con
     errdefer allocator.free(key_copy);
 
     try obj.put(key_copy, value);
+}
+
+fn putOwnedString(allocator: Allocator, object: *json.ObjectMap, key: []const u8, value: []const u8) !void {
+    const value_copy = try allocator.dupe(u8, value);
+    errdefer allocator.free(value_copy);
+    try upsertOwnedObjectEntry(allocator, object, key, .{ .string = value_copy });
+}
+
+fn putOwnedStringIfMissing(allocator: Allocator, object: *json.ObjectMap, key: []const u8, value: []const u8) !void {
+    if (object.get(key) != null) return;
+    try putOwnedString(allocator, object, key, value);
+}
+
+fn isDefaultFingerprint(value: ?[]const []const u8) bool {
+    const fingerprint = value orelse return true;
+    if (fingerprint.len != 1) return false;
+    return std.mem.eql(u8, fingerprint[0], "{{ default }}") or std.mem.eql(u8, fingerprint[0], "{{default}}");
 }
 
 pub fn cloneJsonValue(allocator: Allocator, value: json.Value) !json.Value {
@@ -815,6 +833,52 @@ pub const Scope = struct {
         return null;
     }
 
+    /// Apply scope data to a structured log.
+    /// Returns newly allocated attributes object owned by the caller.
+    pub fn applyToLog(self: *Scope, allocator: Allocator, log_entry: anytype) !json.Value {
+        var attributes_object = json.ObjectMap.init(allocator);
+        errdefer {
+            var owned: json.Value = .{ .object = attributes_object };
+            deinitJsonValueDeep(allocator, &owned);
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        log_entry.trace_id = self.propagation_context.trace_id;
+
+        if (log_entry.attributes) |value| {
+            if (value == .object) {
+                try cloneObjectInto(allocator, &attributes_object, value.object);
+            }
+        }
+
+        try putOwnedStringIfMissing(allocator, &attributes_object, "sentry.sdk.name", envelope.SDK_NAME);
+        try putOwnedStringIfMissing(allocator, &attributes_object, "sentry.sdk.version", envelope.SDK_VERSION);
+        try putOwnedStringIfMissing(
+            allocator,
+            &attributes_object,
+            "parent_span_id",
+            self.propagation_context.span_id[0..],
+        );
+
+        if (self.user) |user| {
+            if (user.id) |id| {
+                try putOwnedStringIfMissing(allocator, &attributes_object, "user.id", id);
+            }
+            if (user.username) |name| {
+                try putOwnedStringIfMissing(allocator, &attributes_object, "user.name", name);
+            }
+            if (user.email) |email| {
+                try putOwnedStringIfMissing(allocator, &attributes_object, "user.email", email);
+            }
+        }
+
+        const enriched: json.Value = .{ .object = attributes_object };
+        log_entry.attributes = enriched;
+        return enriched;
+    }
+
     /// Apply scope transaction metadata to a transaction-like object.
     /// The transaction must provide `setName`, `setUser`, `setTag`, `setExtra`, and `setContext`.
     pub fn applyToTransaction(self: *Scope, transaction: anytype) !void {
@@ -871,7 +935,7 @@ pub const Scope = struct {
             result.applied_transaction = cloned_transaction;
         }
 
-        if (event.fingerprint == null and self.fingerprint.items.len > 0) {
+        if (self.fingerprint.items.len > 0 and isDefaultFingerprint(event.fingerprint)) {
             result.previous_fingerprint = event.fingerprint;
             const cloned_fingerprint = try cloneStringSlice(allocator, self.fingerprint.items);
             event.fingerprint = cloned_fingerprint;
@@ -1308,6 +1372,108 @@ test "Scope applyToEvent sets transaction and fingerprint and restores on cleanu
     cleanupAppliedToEvent(testing.allocator, &event, applied);
     try testing.expect(event.transaction == null);
     try testing.expect(event.fingerprint == null);
+}
+
+test "Scope applyToEvent replaces default fingerprint marker" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    try scope.setFingerprint(&.{ "fp-scope-1", "fp-scope-2" });
+
+    var event = Event.init();
+    event.fingerprint = &.{"{{ default }}"};
+
+    const applied = try scope.applyToEvent(testing.allocator, &event);
+    defer cleanupAppliedToEvent(testing.allocator, &event, applied);
+
+    try testing.expect(event.fingerprint != null);
+    try testing.expectEqual(@as(usize, 2), event.fingerprint.?.len);
+    try testing.expectEqualStrings("fp-scope-1", event.fingerprint.?[0]);
+    try testing.expectEqualStrings("fp-scope-2", event.fingerprint.?[1]);
+}
+
+const LogProbe = struct {
+    trace_id: ?[32]u8 = null,
+    attributes: ?json.Value = null,
+};
+
+test "Scope applyToLog enriches log trace and attributes" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    const trace_id: [32]u8 = "0123456789abcdef0123456789abcdef".*;
+    const span_id: [16]u8 = "89abcdef01234567".*;
+    scope.setPropagationContext(trace_id, span_id);
+    scope.setUser(.{
+        .id = "user-123",
+        .username = "alice",
+        .email = "alice@example.com",
+    });
+
+    var original_attr_object = json.ObjectMap.init(testing.allocator);
+    try original_attr_object.put(
+        try testing.allocator.dupe(u8, "existing"),
+        .{ .string = try testing.allocator.dupe(u8, "value") },
+    );
+    var original_attributes: json.Value = .{ .object = original_attr_object };
+    defer deinitJsonValueDeep(testing.allocator, &original_attributes);
+
+    var probe = LogProbe{
+        .attributes = original_attributes,
+    };
+    const owned_attributes = try scope.applyToLog(testing.allocator, &probe);
+    defer {
+        var owned = owned_attributes;
+        deinitJsonValueDeep(testing.allocator, &owned);
+    }
+
+    try testing.expectEqualSlices(u8, trace_id[0..], probe.trace_id.?[0..]);
+    try testing.expect(probe.attributes != null);
+    try testing.expect(probe.attributes.? == .object);
+
+    const enriched = probe.attributes.?.object;
+    try testing.expectEqualStrings("value", enriched.get("existing").?.string);
+    try testing.expectEqualStrings(envelope.SDK_NAME, enriched.get("sentry.sdk.name").?.string);
+    try testing.expectEqualStrings(envelope.SDK_VERSION, enriched.get("sentry.sdk.version").?.string);
+    try testing.expectEqualStrings(span_id[0..], enriched.get("parent_span_id").?.string);
+    try testing.expectEqualStrings("user-123", enriched.get("user.id").?.string);
+    try testing.expectEqualStrings("alice", enriched.get("user.name").?.string);
+    try testing.expectEqualStrings("alice@example.com", enriched.get("user.email").?.string);
+}
+
+test "Scope applyToLog preserves explicit attribute overrides" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    const trace_id: [32]u8 = "fedcba9876543210fedcba9876543210".*;
+    const span_id: [16]u8 = "0123456789abcdef".*;
+    scope.setPropagationContext(trace_id, span_id);
+    scope.setUser(.{ .id = "scope-user" });
+
+    var attr_object = json.ObjectMap.init(testing.allocator);
+    try attr_object.put(
+        try testing.allocator.dupe(u8, "parent_span_id"),
+        .{ .string = try testing.allocator.dupe(u8, "custom-parent") },
+    );
+    try attr_object.put(
+        try testing.allocator.dupe(u8, "user.id"),
+        .{ .string = try testing.allocator.dupe(u8, "custom-user") },
+    );
+    var original_attributes: json.Value = .{ .object = attr_object };
+    defer deinitJsonValueDeep(testing.allocator, &original_attributes);
+
+    var probe = LogProbe{
+        .attributes = original_attributes,
+    };
+    const owned_attributes = try scope.applyToLog(testing.allocator, &probe);
+    defer {
+        var owned = owned_attributes;
+        deinitJsonValueDeep(testing.allocator, &owned);
+    }
+
+    const enriched = probe.attributes.?.object;
+    try testing.expectEqualStrings("custom-parent", enriched.get("parent_span_id").?.string);
+    try testing.expectEqualStrings("custom-user", enriched.get("user.id").?.string);
 }
 
 const ScopeTransactionProbe = struct {
