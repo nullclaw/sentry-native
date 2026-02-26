@@ -96,6 +96,7 @@ exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 | Trace propagation headers | Implemented | `sentry-trace`/`baggage` generation + incoming `sentry-trace` continuation |
 | Traces sampler callback | Implemented | `traces_sampler` has priority over `traces_sample_rate` |
 | Sessions (application/request mode) | Implemented | Request mode disables duration tracking |
+| Session distinct id (`did`) | Implemented | Derived from `Scope.user` (`id`/`email`/`username`) when available |
 | Monitor check-ins | Implemented | `check_in` envelopes with env inheritance |
 | Worker + queue draining | Implemented | Bounded queue + `flush`/`close` semantics |
 | Transport rate limits | Implemented | `Retry-After` + `X-Sentry-Rate-Limits` parsing |

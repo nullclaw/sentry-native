@@ -123,6 +123,7 @@ pub const Client = struct {
     transport: Transport,
     worker: Worker,
     default_server_name: ?[]u8 = null,
+    session_did: ?[]u8 = null,
     session: ?Session = null,
     last_event_id: ?[32]u8 = null,
     mutex: std.Thread.Mutex = .{},
@@ -165,6 +166,7 @@ pub const Client = struct {
             .transport = transport,
             .worker = worker,
             .default_server_name = default_server_name,
+            .session_did = null,
             .session = null,
             .last_event_id = null,
         };
@@ -209,6 +211,7 @@ pub const Client = struct {
         self.transport.deinit();
         self.scope.deinit();
         if (self.default_server_name) |name| self.allocator.free(name);
+        if (self.session_did) |did| self.allocator.free(did);
 
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -733,14 +736,23 @@ pub const Client = struct {
         if (self.session) |*s| {
             s.end(.exited);
             _ = self.sendSessionUpdate(s);
+            self.session = null;
+        }
+        if (self.session_did) |did| {
+            self.allocator.free(did);
+            self.session_did = null;
         }
 
         const environment = self.options.environment orelse "production";
+        self.session_did = self.resolveSessionDistinctIdAlloc();
         self.session = Session.startWithMode(
             release,
             environment,
             self.options.session_mode == .application,
         );
+        if (self.session) |*s| {
+            s.did = self.session_did;
+        }
     }
 
     /// End the current session with the given status.
@@ -752,6 +764,10 @@ pub const Client = struct {
             s.end(status);
             _ = self.sendSessionUpdate(s);
             self.session = null;
+        }
+        if (self.session_did) |did| {
+            self.allocator.free(did);
+            self.session_did = null;
         }
     }
 
@@ -1166,6 +1182,15 @@ pub const Client = struct {
         const host_name = std.posix.gethostname(&host_buffer) catch return null;
         if (host_name.len == 0) return null;
         return allocator.dupe(u8, host_name) catch null;
+    }
+
+    fn resolveSessionDistinctIdAlloc(self: *Client) ?[]u8 {
+        self.scope.mutex.lock();
+        defer self.scope.mutex.unlock();
+
+        const user = self.scope.user orelse return null;
+        const candidate = user.id orelse user.email orelse user.username orelse return null;
+        return self.allocator.dupe(u8, candidate) catch null;
     }
 
     fn submitEnvelope(self: *Client, data: []u8, category: RateLimitCategory) bool {
@@ -2209,6 +2234,55 @@ test "Client request session mode serializes session updates without duration" {
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"type\":\"session\"") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"status\":\"exited\"") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"duration\"") == null);
+}
+
+test "Client session distinct id uses scope user id" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.setUser(.{
+        .id = "user-42",
+        .email = "test@example.com",
+    });
+    client.startSession();
+
+    try testing.expect(client.session != null);
+    try testing.expect(client.session.?.did != null);
+    try testing.expectEqualStrings("user-42", client.session.?.did.?);
+}
+
+test "Client session distinct id falls back to email then username" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.setUser(.{
+        .email = "mail@example.com",
+        .username = "fallback-user",
+    });
+    client.startSession();
+
+    try testing.expect(client.session != null);
+    try testing.expect(client.session.?.did != null);
+    try testing.expectEqualStrings("mail@example.com", client.session.?.did.?);
+
+    client.endSession(.exited);
+
+    client.setUser(.{
+        .username = "fallback-user",
+    });
+    client.startSession();
+
+    try testing.expect(client.session != null);
+    try testing.expect(client.session.?.did != null);
+    try testing.expectEqualStrings("fallback-user", client.session.?.did.?);
 }
 
 test "Client session counts errors even when events are sampled out" {

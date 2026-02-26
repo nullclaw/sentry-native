@@ -353,6 +353,9 @@ client.startSession();
 client.endSession(.exited);
 ```
 
+If `Scope.user` is set before `startSession`, session `did` is derived from user context
+in priority order: `id`, then `email`, then `username`.
+
 ### Auto mode
 
 ```zig

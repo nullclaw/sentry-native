@@ -820,6 +820,33 @@ test "CJM e2e: request session mode omits duration field" {
     try testing.expect(!relay.containsInAny("\"duration\""));
 }
 
+test "CJM e2e: session distinct id is derived from scope user" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .release = "checkout@1.2.3",
+        .environment = "production",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.setUser(.{ .id = "user-42", .email = "buyer@example.com" });
+    client.startSession();
+    client.endSession(.exited);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"session\""));
+    try testing.expect(relay.containsInAny("\"did\":\"user-42\""));
+}
+
 test "CJM e2e: monitor check-in inherits client environment" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();
