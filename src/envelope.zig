@@ -149,9 +149,21 @@ pub fn serializeCheckInEnvelope(dsn: Dsn, check_in_json: []const u8, writer: *Wr
 
 /// Serialize a structured log envelope.
 pub fn serializeLogEnvelope(dsn: Dsn, log_json: []const u8, writer: *Writer) !void {
+    return serializeLogEnvelopeBatch(dsn, &.{log_json}, writer);
+}
+
+/// Serialize a structured log envelope with one or more log items.
+pub fn serializeLogEnvelopeBatch(dsn: Dsn, logs_json: []const []const u8, writer: *Writer) !void {
+    if (logs_json.len == 0) return error.InvalidLogBatch;
+
     try writeEnvelopeHeader(writer, dsn, null, null);
-    try writeItemHeader(writer, "log", log_json.len);
-    try writer.writeAll(log_json);
+    var i: usize = 0;
+    while (i < logs_json.len) : (i += 1) {
+        const log_json = logs_json[i];
+        try writeItemHeader(writer, "log", log_json.len);
+        try writer.writeAll(log_json);
+        if (i + 1 < logs_json.len) try writer.writeByte('\n');
+    }
 }
 
 pub fn serializeTransactionEnvelope(
@@ -345,6 +357,44 @@ test "serializeLogEnvelope produces valid format" {
     try testing.expect(std.mem.indexOf(u8, line1, "\"dsn\"") != null);
     try testing.expect(std.mem.indexOf(u8, line2, "\"type\":\"log\"") != null);
     try testing.expectEqualStrings(log_json, line3);
+}
+
+test "serializeLogEnvelopeBatch writes multiple log items into one envelope" {
+    const dsn = try Dsn.parse("https://key@sentry.example.com/42");
+    const logs = [_][]const u8{
+        "{\"timestamp\":1.0,\"level\":\"info\",\"body\":\"log-1\"}",
+        "{\"timestamp\":2.0,\"level\":\"warn\",\"body\":\"log-2\"}",
+        "{\"timestamp\":3.0,\"level\":\"error\",\"body\":\"log-3\"}",
+    };
+
+    var aw: Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try serializeLogEnvelopeBatch(dsn, &logs, &aw.writer);
+    const output = aw.written();
+
+    try testing.expect(std.mem.indexOf(u8, output, "\"type\":\"log\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"body\":\"log-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"body\":\"log-2\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"body\":\"log-3\"") != null);
+
+    var type_count: usize = 0;
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, output, index, "\"type\":\"log\"")) |pos| {
+        type_count += 1;
+        index = pos + "\"type\":\"log\"".len;
+    }
+    try testing.expectEqual(@as(usize, 3), type_count);
+}
+
+test "serializeLogEnvelopeBatch rejects empty batches" {
+    const dsn = try Dsn.parse("https://key@sentry.example.com/42");
+    const empty: [0][]const u8 = .{};
+
+    var aw: Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try testing.expectError(error.InvalidLogBatch, serializeLogEnvelopeBatch(dsn, &empty, &aw.writer));
 }
 
 test "serializeTransactionEnvelope produces valid format" {

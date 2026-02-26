@@ -33,6 +33,7 @@ const txn_mod = @import("transaction.zig");
 const Transaction = txn_mod.Transaction;
 const TransactionOpts = txn_mod.TransactionOpts;
 const TransactionOrSpan = txn_mod.TransactionOrSpan;
+const sdk_meta = @import("sdk_meta.zig");
 const log_mod = @import("log.zig");
 const LogEntry = log_mod.LogEntry;
 const LogLevel = log_mod.LogLevel;
@@ -110,7 +111,9 @@ pub const Options = struct {
     max_request_body_size: ?usize = null,
     enable_logs: bool = true,
     cache_dir: []const u8 = "/tmp/sentry-zig",
-    user_agent: []const u8 = "sentry-zig/0.1.0",
+    user_agent: []const u8 = sdk_meta.NAME ++ "/" ++ sdk_meta.VERSION,
+    logs_batch_max_items: usize = 100,
+    logs_batch_flush_interval_ms: u64 = 5000,
     install_signal_handlers: bool = true,
     auto_session_tracking: bool = false,
     session_mode: SessionMode = .application,
@@ -131,6 +134,12 @@ pub const Client = struct {
     session: ?Session = null,
     last_event_id: ?[32]u8 = null,
     mutex: std.Thread.Mutex = .{},
+    log_batch_mutex: std.Thread.Mutex = .{},
+    log_batch_condition: std.Thread.Condition = .{},
+    log_batch_items: std.ArrayListUnmanaged([]u8) = .{},
+    log_batch_first_timestamp_ns: ?i128 = null,
+    log_batch_shutdown: bool = false,
+    log_batch_thread: ?std.Thread = null,
 
     /// Initialize a new Client. Heap-allocates the Client struct so that
     /// internal pointers (e.g., the Worker's send_ctx) remain stable.
@@ -182,6 +191,7 @@ pub const Client = struct {
         }
 
         try self.worker.start();
+        self.startLogBatcher();
 
         std.fs.cwd().makePath(options.cache_dir) catch {};
 
@@ -206,6 +216,7 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         _ = self.close(null);
         self.worker.deinit();
+        self.deinitLogBatchQueue();
 
         // Uninstall signal handlers
         if (self.options.install_signal_handlers) {
@@ -298,10 +309,7 @@ pub const Client = struct {
         }
 
         const log_json = prepared.toJson(self.allocator) catch return;
-        defer self.allocator.free(log_json);
-
-        const data = self.serializeLogEnvelope(log_json) catch return;
-        _ = self.submitEnvelope(data, .log_item);
+        self.enqueueLogPayload(log_json);
     }
 
     /// Capture a simple structured log message.
@@ -932,6 +940,8 @@ pub const Client = struct {
     /// Returns true when the queue was drained before shutdown.
     pub fn close(self: *Client, timeout_ms: ?u64) bool {
         self.endSession(.exited);
+        self.shutdownLogBatcher();
+        self.flushPendingLogBatch();
         const drained = self.worker.flush(timeout_ms orelse self.options.shutdown_timeout_ms);
         self.worker.shutdown();
         return drained;
@@ -947,6 +957,7 @@ pub const Client = struct {
     /// Flush the event queue, waiting up to timeout_ms.
     /// Returns true if the queue was fully drained.
     pub fn flush(self: *Client, timeout_ms: u64) bool {
+        self.flushPendingLogBatch();
         return self.worker.flush(timeout_ms);
     }
 
@@ -1351,10 +1362,181 @@ pub const Client = struct {
     }
 
     fn serializeLogEnvelope(self: *Client, log_json: []const u8) ![]u8 {
+        return self.serializeLogBatchEnvelope(&.{log_json});
+    }
+
+    fn serializeLogBatchEnvelope(self: *Client, logs_json: []const []const u8) ![]u8 {
         var aw: Writer.Allocating = .init(self.allocator);
         errdefer aw.deinit();
-        try envelope.serializeLogEnvelope(self.dsn, log_json, &aw.writer);
+        try envelope.serializeLogEnvelopeBatch(self.dsn, logs_json, &aw.writer);
         return try aw.toOwnedSlice();
+    }
+
+    fn logBatchIntervalNs(self: *Client) i128 {
+        return @as(i128, @intCast(self.options.logs_batch_flush_interval_ms)) * std.time.ns_per_ms;
+    }
+
+    fn effectiveLogBatchMaxItems(self: *Client) usize {
+        return if (self.options.logs_batch_max_items == 0) 1 else self.options.logs_batch_max_items;
+    }
+
+    fn shouldFlushLogBatchLocked(self: *Client, now_ns: i128) bool {
+        if (self.log_batch_items.items.len == 0) return false;
+        if (self.log_batch_items.items.len >= self.effectiveLogBatchMaxItems()) return true;
+
+        const first_ns = self.log_batch_first_timestamp_ns orelse return false;
+        return now_ns - first_ns >= self.logBatchIntervalNs();
+    }
+
+    fn takeLogBatchLocked(self: *Client) std.ArrayListUnmanaged([]u8) {
+        const batch = self.log_batch_items;
+        self.log_batch_items = .{};
+        self.log_batch_first_timestamp_ns = null;
+        return batch;
+    }
+
+    fn deinitLogBatchItems(self: *Client, items: *std.ArrayListUnmanaged([]u8)) void {
+        for (items.items) |payload| {
+            self.allocator.free(payload);
+        }
+        items.deinit(self.allocator);
+        items.* = .{};
+    }
+
+    fn submitLogBatch(self: *Client, items: *std.ArrayListUnmanaged([]u8)) void {
+        if (items.items.len == 0) {
+            items.deinit(self.allocator);
+            return;
+        }
+        defer self.deinitLogBatchItems(items);
+
+        const data = self.serializeLogBatchEnvelope(items.items) catch return;
+        _ = self.submitEnvelope(data, .log_item);
+    }
+
+    fn enqueueLogPayload(self: *Client, payload: []u8) void {
+        if (!self.options.enable_logs) {
+            self.allocator.free(payload);
+            return;
+        }
+
+        var batch_to_flush: std.ArrayListUnmanaged([]u8) = .{};
+
+        self.log_batch_mutex.lock();
+
+        if (self.log_batch_shutdown) {
+            self.log_batch_mutex.unlock();
+            self.allocator.free(payload);
+            return;
+        }
+
+        self.log_batch_items.append(self.allocator, payload) catch {
+            self.log_batch_mutex.unlock();
+            self.allocator.free(payload);
+            return;
+        };
+
+        if (self.log_batch_first_timestamp_ns == null) {
+            self.log_batch_first_timestamp_ns = std.time.nanoTimestamp();
+        }
+
+        const now_ns = std.time.nanoTimestamp();
+        const flush_now = self.shouldFlushLogBatchLocked(now_ns);
+        if (flush_now) {
+            batch_to_flush = self.takeLogBatchLocked();
+        }
+
+        self.log_batch_condition.signal();
+        self.log_batch_mutex.unlock();
+
+        if (flush_now) self.submitLogBatch(&batch_to_flush);
+    }
+
+    fn flushPendingLogBatch(self: *Client) void {
+        var batch: std.ArrayListUnmanaged([]u8) = .{};
+
+        self.log_batch_mutex.lock();
+        if (self.log_batch_items.items.len > 0) {
+            batch = self.takeLogBatchLocked();
+        }
+        self.log_batch_mutex.unlock();
+
+        self.submitLogBatch(&batch);
+    }
+
+    fn logBatcherLoop(self: *Client) void {
+        while (true) {
+            var batch: std.ArrayListUnmanaged([]u8) = .{};
+
+            self.log_batch_mutex.lock();
+            while (true) {
+                if (self.log_batch_shutdown and self.log_batch_items.items.len == 0) {
+                    self.log_batch_mutex.unlock();
+                    return;
+                }
+
+                if (self.log_batch_shutdown) {
+                    batch = self.takeLogBatchLocked();
+                    break;
+                }
+
+                const now_ns = std.time.nanoTimestamp();
+                if (self.shouldFlushLogBatchLocked(now_ns)) {
+                    batch = self.takeLogBatchLocked();
+                    break;
+                }
+
+                if (self.log_batch_items.items.len == 0) {
+                    self.log_batch_condition.wait(&self.log_batch_mutex);
+                } else {
+                    const first_ns = self.log_batch_first_timestamp_ns orelse now_ns;
+                    const interval_ns = self.logBatchIntervalNs();
+                    const elapsed_ns = now_ns - first_ns;
+                    const remaining_ns: u64 = if (elapsed_ns >= interval_ns)
+                        0
+                    else
+                        @as(u64, @intCast(interval_ns - elapsed_ns));
+                    self.log_batch_condition.timedWait(&self.log_batch_mutex, remaining_ns) catch {};
+                }
+            }
+            self.log_batch_mutex.unlock();
+
+            self.submitLogBatch(&batch);
+        }
+    }
+
+    fn startLogBatcher(self: *Client) void {
+        if (!self.options.enable_logs) return;
+
+        self.log_batch_mutex.lock();
+        defer self.log_batch_mutex.unlock();
+
+        self.log_batch_shutdown = false;
+        if (self.log_batch_thread != null) return;
+
+        self.log_batch_thread = std.Thread.spawn(.{}, logBatchThreadEntry, .{self}) catch null;
+    }
+
+    fn shutdownLogBatcher(self: *Client) void {
+        self.log_batch_mutex.lock();
+        self.log_batch_shutdown = true;
+        self.log_batch_condition.signal();
+        self.log_batch_mutex.unlock();
+
+        if (self.log_batch_thread) |thread| {
+            thread.join();
+            self.log_batch_thread = null;
+        }
+    }
+
+    fn deinitLogBatchQueue(self: *Client) void {
+        self.log_batch_mutex.lock();
+        defer self.log_batch_mutex.unlock();
+        self.deinitLogBatchItems(&self.log_batch_items);
+    }
+
+    fn logBatchThreadEntry(self: *Client) void {
+        self.logBatcherLoop();
     }
 
     fn sendSessionUpdate(self: *Client, session: *Session) bool {
@@ -1455,7 +1637,9 @@ test "Options struct has correct defaults" {
     try testing.expect(!opts.accept_invalid_certs);
     try testing.expect(opts.max_request_body_size == null);
     try testing.expect(opts.enable_logs);
-    try testing.expectEqualStrings("sentry-zig/0.1.0", opts.user_agent);
+    try testing.expectEqualStrings(sdk_meta.NAME ++ "/" ++ sdk_meta.VERSION, opts.user_agent);
+    try testing.expectEqual(@as(usize, 100), opts.logs_batch_max_items);
+    try testing.expectEqual(@as(u64, 5000), opts.logs_batch_flush_interval_ms);
     try testing.expect(opts.install_signal_handlers);
     try testing.expect(!opts.auto_session_tracking);
     try testing.expectEqual(SessionMode.application, opts.session_mode);
@@ -1686,6 +1870,44 @@ fn payloadTransportSendFn(data: []const u8, ctx: ?*anyopaque) SendOutcome {
     state.sent_count += 1;
     if (state.last_payload) |payload| state.allocator.free(payload);
     state.last_payload = state.allocator.dupe(u8, data) catch null;
+    return .{};
+}
+
+const MultiPayloadTransportState = struct {
+    allocator: Allocator,
+    sent_count: usize = 0,
+    payloads: std.ArrayListUnmanaged([]u8) = .{},
+
+    fn init(allocator: Allocator) MultiPayloadTransportState {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *MultiPayloadTransportState) void {
+        for (self.payloads.items) |payload| {
+            self.allocator.free(payload);
+        }
+        self.payloads.deinit(self.allocator);
+        self.* = undefined;
+    }
+};
+
+fn multiPayloadTransportSendFn(data: []const u8, ctx: ?*anyopaque) SendOutcome {
+    const state: *MultiPayloadTransportState = @ptrCast(@alignCast(ctx.?));
+    state.sent_count += 1;
+    const copied = state.allocator.dupe(u8, data) catch return .{};
+    state.payloads.append(state.allocator, copied) catch {
+        state.allocator.free(copied);
+    };
+    return .{};
+}
+
+const AtomicCountTransportState = struct {
+    count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+};
+
+fn atomicCountTransportSendFn(_: []const u8, ctx: ?*anyopaque) SendOutcome {
+    const state: *AtomicCountTransportState = @ptrCast(@alignCast(ctx.?));
+    _ = state.count.fetchAdd(1, .seq_cst);
     return .{};
 }
 
@@ -2639,6 +2861,118 @@ test "Client captureLogMessage enriches sdk and scope log attributes" {
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"user.id\":\"user-42\"") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"user.name\":\"buyer\"") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"user.email\":\"buyer@example.com\"") != null);
+}
+
+test "Client batches logs by max items into fewer envelopes" {
+    var state = MultiPayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .logs_batch_max_items = 3,
+        .logs_batch_flush_interval_ms = 60_000,
+        .transport = .{
+            .send_fn = multiPayloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var i: usize = 0;
+    while (i < 7) : (i += 1) {
+        const message = try std.fmt.allocPrint(testing.allocator, "batch-log-{d}", .{i});
+        defer testing.allocator.free(message);
+        client.captureLogMessage(message, .info);
+    }
+
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 3), state.sent_count);
+
+    var total_log_item_headers: usize = 0;
+    for (state.payloads.items) |payload| {
+        var search_index: usize = 0;
+        while (std.mem.indexOfPos(u8, payload, search_index, "\"type\":\"log\"")) |pos| {
+            total_log_item_headers += 1;
+            search_index = pos + "\"type\":\"log\"".len;
+        }
+    }
+    try testing.expectEqual(@as(usize, 7), total_log_item_headers);
+}
+
+test "Client flush drains pending log batch even below max size" {
+    var state = MultiPayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .logs_batch_max_items = 10,
+        .logs_batch_flush_interval_ms = 60_000,
+        .transport = .{
+            .send_fn = multiPayloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureLogMessage("flush-batch-log-1", .info);
+    client.captureLogMessage("flush-batch-log-2", .warn);
+
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.payloads.items.len > 0);
+    try testing.expect(std.mem.indexOf(u8, state.payloads.items[0], "\"flush-batch-log-1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.payloads.items[0], "\"flush-batch-log-2\"") != null);
+}
+
+test "Client close drains pending log batch before shutdown" {
+    var state = MultiPayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .logs_batch_max_items = 10,
+        .logs_batch_flush_interval_ms = 60_000,
+        .transport = .{
+            .send_fn = multiPayloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureLogMessage("close-batch-log", .info);
+    try testing.expect(client.close(1000));
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.payloads.items.len > 0);
+    try testing.expect(std.mem.indexOf(u8, state.payloads.items[0], "\"close-batch-log\"") != null);
+}
+
+test "Client log batcher flushes logs after configured interval" {
+    var state = AtomicCountTransportState{};
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .logs_batch_max_items = 100,
+        .logs_batch_flush_interval_ms = 40,
+        .transport = .{
+            .send_fn = atomicCountTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureLogMessage("interval-batch-log", .info);
+
+    std.Thread.sleep(120 * std.time.ns_per_ms);
+
+    const sent = state.count.load(.seq_cst);
+    try testing.expect(sent >= 1);
 }
 
 test "Client before_send_log drops replacement pointers for memory safety" {
