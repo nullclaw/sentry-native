@@ -791,6 +791,53 @@ test "CJM e2e: client scope enriches transaction metadata" {
     try testing.expect(relay.containsInAny("\"scope-context\":8"));
 }
 
+test "CJM e2e: global transaction API uses current hub scope metadata" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try sentry.Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    const previous_hub = sentry.setCurrentHub(&hub);
+    defer {
+        if (previous_hub) |prev| {
+            _ = sentry.setCurrentHub(prev);
+        } else {
+            _ = sentry.clearCurrentHub();
+        }
+    }
+
+    try hub.trySetTag("hub-global-tag", "checkout");
+    try hub.trySetExtra("hub-global-extra", .{ .integer = 5 });
+    try hub.trySetContext("hub-global-context", .{ .integer = 6 });
+
+    var txn = sentry.startTransaction(.{
+        .name = "POST /checkout-global",
+        .op = "http.server",
+    }).?;
+    defer txn.deinit();
+
+    try testing.expect(sentry.finishTransaction(&txn));
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"hub-global-tag\":\"checkout\""));
+    try testing.expect(relay.containsInAny("\"hub-global-extra\":5"));
+    try testing.expect(relay.containsInAny("\"hub-global-context\":6"));
+}
+
 test "CJM e2e: transaction and span request metadata is serialized" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();
