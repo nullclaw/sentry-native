@@ -9,8 +9,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    _ = sentry_mod;
 
+    // ─── Unit Tests ─────────────────────────────────────────────────────
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/sentry.zig"),
         .target = target,
@@ -22,6 +22,26 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run unit tests");
+
+    // ─── Integration Tests ──────────────────────────────────────────────
+    const integration_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/integration_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    integration_test_mod.addImport("sentry-zig", sentry_mod);
+
+    const integration_tests = b.addTest(.{
+        .root_module = integration_test_mod,
+    });
+
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+
+    const test_integration_step = b.step("test-integration", "Run integration tests");
+    test_integration_step.dependOn(&run_integration_tests.step);
+
+    // ─── Test Step (runs both unit and integration tests) ───────────────
+    const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_integration_tests.step);
 }
