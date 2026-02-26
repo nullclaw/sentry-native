@@ -248,6 +248,9 @@ pub const TransactionOpts = struct {
     description: ?[]const u8 = null,
     // Optional arbitrary context passed to traces_sampler only.
     custom_sampling_context: ?json.Value = null,
+    // Optional sampling hint equivalent to TransactionContext::set_sampled.
+    // When traces_sampler is set, this is passed through sampling context.
+    sampled_override: ?bool = null,
     start_timestamp: ?f64 = null,
     sampled: bool = true,
     sample_rate: f64 = 1.0,

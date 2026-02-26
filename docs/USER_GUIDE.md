@@ -339,6 +339,9 @@ const client = try sentry.init(allocator, .{
 Sampler context includes `transaction_name`, `transaction_op`, `trace_id`, `span_id`,
 `parent_sampled`, and per-transaction custom input from
 `TransactionOpts.custom_sampling_context`.
+When `traces_sampler` is not set, `TransactionOpts.sampled_override`
+forces per-transaction sampling (`true` => rate `1.0`, `false` => rate `0.0`)
+and takes precedence over `TransactionOpts.sample_rate`.
 
 For regular event messages, the SDK automatically adds default contexts
 (`contexts.trace`, `contexts.runtime`, `contexts.os`) when trace context
@@ -485,6 +488,8 @@ client.captureLog(&log_entry);
 
 For advanced fields, set `LogEntry.attributes` and `LogEntry.trace_id`
 before sending.
+When options are configured, default log attributes are added if missing:
+`sentry.environment`, `sentry.release`, and `server.address`.
 
 Use `before_send_log` to drop or mutate structured logs before queueing.
 

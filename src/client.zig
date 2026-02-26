@@ -298,8 +298,9 @@ pub const Client = struct {
             prepared.attributes = null;
         };
         owned_log_attributes = source_scope.applyToLog(self.allocator, &prepared) catch null;
-        if (owned_log_attributes) |attributes| {
-            prepared.attributes = attributes;
+        if (owned_log_attributes) |*attributes| {
+            self.injectDefaultLogAttributes(attributes) catch return;
+            prepared.attributes = attributes.*;
         }
 
         if (self.options.before_send_log) |before_send_log| {
@@ -427,6 +428,10 @@ pub const Client = struct {
                 prepared_event.threads = value;
                 owned_threads = value;
             }
+        }
+
+        if (std.mem.eql(u8, prepared_event.platform, "other")) {
+            prepared_event.platform = "native";
         }
 
         // Run before_send callback
@@ -667,6 +672,7 @@ pub const Client = struct {
         if (real_opts.span_id == null) {
             real_opts.span_id = txn_mod.generateSpanId();
         }
+        const sampling_hint = real_opts.sampled_override orelse real_opts.parent_sampled;
 
         const effective_sample_rate: f64 = blk: {
             if (self.options.traces_sampler) |sampler| {
@@ -675,15 +681,19 @@ pub const Client = struct {
                     .transaction_op = real_opts.op,
                     .trace_id = real_opts.trace_id.?,
                     .span_id = real_opts.span_id.?,
-                    .parent_sampled = real_opts.parent_sampled,
+                    .parent_sampled = sampling_hint,
                     .custom_sampling_context = if (real_opts.custom_sampling_context) |*value| value else null,
                 });
                 break :blk if (isValidSampleRate(sampled_rate)) sampled_rate else 0.0;
             }
 
+            if (real_opts.sampled_override) |override| {
+                break :blk if (override) 1.0 else 0.0;
+            }
+
             if (real_opts.sample_rate == 1.0) {
-                if (real_opts.parent_sampled) |parent_sampled| {
-                    break :blk if (parent_sampled) 1.0 else 0.0;
+                if (sampling_hint) |hint| {
+                    break :blk if (hint) 1.0 else 0.0;
                 }
                 break :blk self.options.traces_sample_rate;
             }
@@ -1098,6 +1108,32 @@ pub const Client = struct {
         value: bool,
     ) !void {
         try putOwnedJsonEntry(allocator, object, key, .{ .bool = value });
+    }
+
+    fn putOwnedStringIfMissing(
+        allocator: Allocator,
+        object: *json.ObjectMap,
+        key: []const u8,
+        value: []const u8,
+    ) !void {
+        if (object.get(key) == null) {
+            try putOwnedString(allocator, object, key, value);
+        }
+    }
+
+    fn injectDefaultLogAttributes(self: *Client, attributes: *json.Value) !void {
+        if (attributes.* != .object) return;
+        const obj = &attributes.object;
+
+        if (self.options.environment) |environment| {
+            try putOwnedStringIfMissing(self.allocator, obj, "sentry.environment", environment);
+        }
+        if (self.options.release) |release| {
+            try putOwnedStringIfMissing(self.allocator, obj, "sentry.release", release);
+        }
+        if (self.options.server_name orelse self.default_server_name) |server_name| {
+            try putOwnedStringIfMissing(self.allocator, obj, "server.address", server_name);
+        }
     }
 
     fn buildDefaultTraceContexts(
@@ -1884,6 +1920,11 @@ fn sampleTracesAndCaptureIds(ctx: TracesSamplingContext) f64 {
     return 1.0;
 }
 
+fn sampleTracesCaptureHintAndDrop(ctx: TracesSamplingContext) f64 {
+    sampler_observed_parent_sampled = ctx.parent_sampled;
+    return 0.0;
+}
+
 const CustomTransportState = struct {
     sent_count: usize = 0,
 };
@@ -2033,6 +2074,7 @@ var before_send_saw_threads: bool = false;
 var before_send_first_frame_in_app: ?bool = null;
 var before_send_observed_server_name: ?[]const u8 = null;
 var before_send_observed_dist: ?[]const u8 = null;
+var before_send_observed_platform: ?[]const u8 = null;
 var before_send_breadcrumbs_match: bool = false;
 var combined_sequence_event_count: usize = 0;
 var combined_sequence_first_ok: bool = false;
@@ -2123,6 +2165,11 @@ fn inspectServerNameBeforeSend(event: *Event) ?*Event {
 
 fn inspectDistBeforeSend(event: *Event) ?*Event {
     before_send_observed_dist = event.dist;
+    return event;
+}
+
+fn inspectPlatformBeforeSend(event: *Event) ?*Event {
+    before_send_observed_platform = event.platform;
     return event;
 }
 
@@ -2474,6 +2521,25 @@ test "Client fallback server_name is applied when option is unset" {
     try testing.expect(client.captureMessageId("server-name-fallback", .info) != null);
     try testing.expect(before_send_observed_server_name != null);
     try testing.expectEqualStrings("detected-host", before_send_observed_server_name.?);
+}
+
+test "Client normalizes event platform other to native before before_send" {
+    before_send_observed_platform = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send = inspectPlatformBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var event = Event.initMessage("platform-override", .info);
+    event.platform = "other";
+
+    const event_id = client.captureEventId(&event);
+    try testing.expect(event_id != null);
+    try testing.expect(before_send_observed_platform != null);
+    try testing.expectEqualStrings("native", before_send_observed_platform.?);
 }
 
 test "Client explicit server_name takes precedence over fallback server_name" {
@@ -2907,6 +2973,33 @@ test "Client captureLogMessage enriches sdk and scope log attributes" {
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"user.email\":\"buyer@example.com\"") != null);
 }
 
+test "Client captureLogMessage adds release environment and server defaults" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.2.3",
+        .environment = "staging",
+        .server_name = "edge-01",
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureLogMessage("log-with-default-attrs", .info);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"sentry.environment\":\"staging\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"sentry.release\":\"my-app@1.2.3\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"server.address\":\"edge-01\"") != null);
+}
+
 test "Client batches logs by max items into fewer envelopes" {
     var state = MultiPayloadTransportState.init(testing.allocator);
     defer state.deinit();
@@ -3274,6 +3367,65 @@ test "Client traces_sampler overrides traces_sample_rate" {
 
     try testing.expectEqual(@as(f64, 0.0), never_txn.sample_rate);
     try testing.expect(!never_txn.sampled);
+}
+
+test "Client sampled_override controls sampling when traces_sampler is unset" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 0.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var forced_sampled = client.startTransaction(.{
+        .name = "GET /forced-sampled",
+        .sampled_override = true,
+    });
+    defer forced_sampled.deinit();
+
+    try testing.expectEqual(@as(f64, 1.0), forced_sampled.sample_rate);
+    try testing.expect(forced_sampled.sampled);
+
+    var forced_unsampled = client.startTransaction(.{
+        .name = "GET /forced-unsampled",
+        .sampled_override = false,
+    });
+    defer forced_unsampled.deinit();
+
+    try testing.expectEqual(@as(f64, 0.0), forced_unsampled.sample_rate);
+    try testing.expect(!forced_unsampled.sampled);
+
+    var override_beats_explicit_rate = client.startTransaction(.{
+        .name = "GET /override-beats-rate",
+        .sampled_override = false,
+        .sample_rate = 0.9,
+    });
+    defer override_beats_explicit_rate.deinit();
+
+    try testing.expectEqual(@as(f64, 0.0), override_beats_explicit_rate.sample_rate);
+    try testing.expect(!override_beats_explicit_rate.sampled);
+}
+
+test "Client sampled_override is passed to traces_sampler hint but sampler decides final" {
+    sampler_observed_parent_sampled = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .traces_sampler = sampleTracesCaptureHintAndDrop,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "GET /sampler-hint",
+        .sampled_override = true,
+    });
+    defer txn.deinit();
+
+    try testing.expectEqual(@as(?bool, true), sampler_observed_parent_sampled);
+    try testing.expectEqual(@as(f64, 0.0), txn.sample_rate);
+    try testing.expect(!txn.sampled);
 }
 
 test "Client traces_sampler receives custom sampling context from transaction opts" {

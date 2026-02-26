@@ -270,6 +270,11 @@ When `default_integrations = false`, automatic runtime/os context enrichment is 
 (trace context bootstrap remains enabled).
 `traces_sampler` receives `transaction_name`, `transaction_op`, `trace_id`, `span_id`,
 `parent_sampled`, and optional `custom_sampling_context` from `TransactionOpts`.
+Without `traces_sampler`, `TransactionOpts.sampled_override` forces per-transaction
+sampling (`true` => `1.0`, `false` => `0.0`) and overrides
+`TransactionOpts.sample_rate`.
+Structured log records automatically include default `sentry.environment`,
+`sentry.release`, and `server.address` attributes when configured.
 When `server_name` is unset and `default_integrations = true`, the SDK attempts to use the local hostname.
 `in_app_include`/`in_app_exclude` are applied to exception stack frames.
 `accept_invalid_certs=true` is intended for local/dev environments and is not supported together with explicit proxy transport.
