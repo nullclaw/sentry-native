@@ -3463,6 +3463,24 @@ test "Client sampled_override controls sampling when traces_sampler is unset" {
     try testing.expect(override_beats_legacy_sampled_flag.sampled);
 }
 
+test "Client legacy sampled=false disables transaction when no sampler and no override" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "GET /legacy-sampled-false",
+        .sampled = false,
+    });
+    defer txn.deinit();
+
+    try testing.expectEqual(@as(f64, 0.0), txn.sample_rate);
+    try testing.expect(!txn.sampled);
+}
+
 test "Client sampled_override is passed to traces_sampler hint but sampler decides final" {
     sampler_observed_parent_sampled = null;
 
