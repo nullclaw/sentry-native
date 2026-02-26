@@ -561,6 +561,78 @@ test "Monitor check-in JSON serialization" {
 
 // ─── 8. CJM End-to-End Flows (Client + Transport + Worker) ─────────────────
 
+test "CJM e2e: full flow captures event transaction log session and check-in" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .release = "checkout@2.0.0",
+        .dist = "9001",
+        .environment = "production",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.setUser(.{ .id = "user-full-flow", .email = "flow@example.com" });
+    client.setTag("cjm", "full-flow");
+    client.addBreadcrumb(.{
+        .category = "flow",
+        .message = "full-flow-start",
+        .level = .info,
+    });
+
+    client.startSession();
+    client.captureMessage("full-flow-message", .warning);
+    client.captureException("CheckoutError", "payment provider timeout");
+
+    var txn = client.startTransaction(.{
+        .name = "POST /checkout-full-flow",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const child = try txn.startChild(.{
+        .op = "db.query",
+        .description = "INSERT INTO orders",
+    });
+    child.finish();
+
+    client.setSpan(.{ .transaction = &txn });
+    try testing.expect(client.captureMessageId("full-flow-event-with-span", .info) != null);
+    client.captureLogMessage("full-flow-log", .warn);
+    client.finishTransaction(&txn);
+    client.setSpan(null);
+
+    var check_in = sentry.MonitorCheckIn.init("checkout-full-flow-cron", .in_progress);
+    client.captureCheckIn(&check_in);
+    client.endSession(.exited);
+
+    try testing.expect(client.flush(3000));
+    try testing.expect(relay.waitForAtLeast(8, 3000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"event\""));
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"type\":\"log\""));
+    try testing.expect(relay.containsInAny("\"type\":\"session\""));
+    try testing.expect(relay.containsInAny("\"type\":\"check_in\""));
+
+    try testing.expect(relay.containsInAny("\"full-flow-message\""));
+    try testing.expect(relay.containsInAny("\"CheckoutError\""));
+    try testing.expect(relay.containsInAny("\"transaction\":\"POST /checkout-full-flow\""));
+    try testing.expect(relay.containsInAny("\"body\":\"full-flow-log\""));
+    try testing.expect(relay.containsInAny("\"monitor_slug\":\"checkout-full-flow-cron\""));
+    try testing.expect(relay.containsInAny("\"did\":\"user-full-flow\""));
+    try testing.expect(relay.containsInAny("\"release\":\"checkout@2.0.0\""));
+    try testing.expect(relay.containsInAny("\"dist\":\"9001\""));
+    try testing.expect(relay.containsInAny("\"environment\":\"production\""));
+}
+
 test "CJM e2e: event with scope and attachment reaches relay" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();
