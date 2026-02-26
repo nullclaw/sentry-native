@@ -386,6 +386,20 @@ fn withScopeMutateTag(hub: *Hub) void {
     hub.setTag("scope", "inner");
 }
 
+fn withScopeCaptureAttachment(hub: *Hub) void {
+    var attachment = Attachment.initOwned(
+        testing.allocator,
+        "with-scope.txt",
+        "scope-attachment",
+        "text/plain",
+        null,
+    ) catch return;
+    defer attachment.deinit(testing.allocator);
+
+    hub.addAttachment(attachment);
+    _ = hub.captureMessageId("with-scope message", .err);
+}
+
 fn configureScopeSetTag(scope: *Scope) void {
     scope.setTag("scope", "configured") catch {};
 }
@@ -532,6 +546,37 @@ test "Hub withScope auto pops temporary scope" {
     try hub.trySetTag("scope", "outer");
     try hub.withScope(withScopeMutateTag);
     try testing.expectEqualStrings("outer", hub.currentScope().tags.get("scope").?);
+}
+
+test "Hub withScope sends scoped attachment and does not leak it to parent scope" {
+    var state = HubPayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .transport = .{
+            .send_fn = hubPayloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    try testing.expectEqual(@as(usize, 0), hub.currentScope().attachments.items.len);
+
+    try hub.withScope(withScopeCaptureAttachment);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"type\":\"attachment\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"filename\":\"with-scope.txt\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "scope-attachment") != null);
+
+    try testing.expectEqual(@as(usize, 0), hub.currentScope().attachments.items.len);
 }
 
 test "Hub configureScope applies staged mutation to current scope" {
