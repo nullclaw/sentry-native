@@ -5,6 +5,7 @@ const json = std.json;
 
 const event_mod = @import("event.zig");
 const Event = event_mod.Event;
+const Level = event_mod.Level;
 const User = event_mod.User;
 const Breadcrumb = event_mod.Breadcrumb;
 const ts = @import("timestamp.zig");
@@ -282,6 +283,7 @@ fn deinitJsonMapOwned(allocator: Allocator, map: *std.StringHashMap(json.Value))
 /// The Scope holds mutable state applied to every event.
 pub const Scope = struct {
     allocator: Allocator,
+    level: ?Level = null,
     user: ?User = null,
     tags: std.StringHashMap([]const u8),
     extra: std.StringHashMap(json.Value),
@@ -325,6 +327,13 @@ pub const Scope = struct {
         if (user) |u| {
             self.user = cloneUser(self.allocator, u) catch null;
         }
+    }
+
+    /// Set the event level for this scope.
+    pub fn setLevel(self: *Scope, level: ?Level) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.level = level;
     }
 
     /// Set a tag (thread-safe).
@@ -439,6 +448,10 @@ pub const Scope = struct {
         defer self.mutex.unlock();
 
         var result: ApplyResult = .{};
+
+        if (self.level) |level| {
+            event.level = level;
+        }
 
         // Apply user only when event user is not set.
         if (event.user == null and self.user != null) {
@@ -562,6 +575,7 @@ pub const Scope = struct {
             deinitUserDeep(self.allocator, u);
             self.user = null;
         }
+        self.level = null;
 
         clearTagMapOwned(self.allocator, &self.tags);
         clearJsonMapOwned(self.allocator, &self.extra);
@@ -794,4 +808,19 @@ test "Scope removeExtra and removeContext remove owned values" {
 
     try testing.expect(scope.extra.get("extra-key") == null);
     try testing.expect(scope.contexts.get("ctx-key") == null);
+}
+
+test "Scope level overrides event level during applyToEvent" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    scope.setLevel(.fatal);
+
+    var event = Event.init();
+    event.level = .info;
+
+    const applied = try scope.applyToEvent(testing.allocator, &event);
+    defer cleanupAppliedToEvent(testing.allocator, &event, applied);
+
+    try testing.expectEqual(Level.fatal, event.level.?);
 }

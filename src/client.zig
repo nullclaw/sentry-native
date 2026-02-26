@@ -224,6 +224,11 @@ pub const Client = struct {
         self.scope.setTag(key, value) catch {};
     }
 
+    /// Set the default level for events in the current scope.
+    pub fn setLevel(self: *Client, level: ?Level) void {
+        self.scope.setLevel(level);
+    }
+
     /// Remove a tag.
     pub fn removeTag(self: *Client, key: []const u8) void {
         self.scope.removeTag(key);
