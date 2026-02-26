@@ -90,6 +90,18 @@ pub const Hub = struct {
         callback(self);
     }
 
+    /// Run callback with a temporary pushed scope configured before execution.
+    pub fn withConfiguredScope(
+        self: *Hub,
+        scope_config: *const fn (*Scope) void,
+        callback: *const fn (*Hub) void,
+    ) !void {
+        try self.pushScope();
+        defer _ = self.popScope();
+        scope_config(self.topScope());
+        callback(self);
+    }
+
     pub fn withIntegration(
         self: *Hub,
         setup: IntegrationSetupFn,
@@ -396,6 +408,18 @@ fn withScopeMutateTag(hub: *Hub) void {
     hub.setTag("scope", "inner");
 }
 
+fn withConfiguredScopeSetTag(scope: *Scope) void {
+    scope.setTag("scope", "configured-temp") catch {};
+}
+
+var with_configured_scope_observed_match: bool = false;
+
+fn withConfiguredScopeObserveTag(hub: *Hub) void {
+    with_configured_scope_observed_match = false;
+    const value = hub.currentScope().tags.get("scope") orelse return;
+    with_configured_scope_observed_match = std.mem.eql(u8, value, "configured-temp");
+}
+
 fn withScopeCaptureAttachment(hub: *Hub) void {
     var attachment = Attachment.initOwned(
         testing.allocator,
@@ -555,6 +579,24 @@ test "Hub withScope auto pops temporary scope" {
 
     try hub.trySetTag("scope", "outer");
     try hub.withScope(withScopeMutateTag);
+    try testing.expectEqualStrings("outer", hub.currentScope().tags.get("scope").?);
+}
+
+test "Hub withConfiguredScope applies temporary scope configuration" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    with_configured_scope_observed_match = false;
+    try hub.trySetTag("scope", "outer");
+    try hub.withConfiguredScope(withConfiguredScopeSetTag, withConfiguredScopeObserveTag);
+
+    try testing.expect(with_configured_scope_observed_match);
     try testing.expectEqualStrings("outer", hub.currentScope().tags.get("scope").?);
 }
 

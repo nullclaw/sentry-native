@@ -239,6 +239,12 @@ pub fn withScope(callback: *const fn (*Hub) void) bool {
     return true;
 }
 
+pub fn withConfiguredScope(scope_config: *const fn (*Scope) void, callback: *const fn (*Hub) void) bool {
+    const hub = Hub.current() orelse return false;
+    hub.withConfiguredScope(scope_config, callback) catch return false;
+    return true;
+}
+
 pub fn withIntegration(setup: IntegrationSetupFn, callback: IntegrationLookupCallback) bool {
     const hub = Hub.current() orelse {
         callback(null);
@@ -264,6 +270,18 @@ fn configureScopeSetOuter(scope: *Scope) void {
 
 fn configureScopeSetInner(scope: *Scope) void {
     scope.setTag("which_scope", "scope2") catch {};
+}
+
+fn withConfiguredScopeSetTag(scope: *Scope) void {
+    scope.setTag("scope", "configured") catch {};
+}
+
+var with_configured_scope_seen_match: bool = false;
+
+fn observeConfiguredScopeTag(hub: *Hub) void {
+    with_configured_scope_seen_match = false;
+    const value = hub.currentScope().tags.get("scope") orelse return;
+    with_configured_scope_seen_match = std.mem.eql(u8, value, "configured");
 }
 
 var global_integration_lookup_called: bool = false;
@@ -331,6 +349,9 @@ test "global wrappers are safe no-op without current hub" {
     addBreadcrumb(.{ .message = "no-hub" });
     clearBreadcrumbs();
     try std.testing.expect(!withScope(withScopeSetTag));
+    with_configured_scope_seen_match = false;
+    try std.testing.expect(!withConfiguredScope(withConfiguredScopeSetTag, observeConfiguredScopeTag));
+    try std.testing.expect(!with_configured_scope_seen_match);
 }
 
 test "global wrappers route through current hub" {
@@ -364,6 +385,10 @@ test "global wrappers route through current hub" {
     try std.testing.expect(setSpan(null));
 
     try std.testing.expect(withScope(withScopeSetTag));
+    try std.testing.expect(hub.currentScope().tags.get("scope") == null);
+    with_configured_scope_seen_match = false;
+    try std.testing.expect(withConfiguredScope(withConfiguredScopeSetTag, observeConfiguredScopeTag));
+    try std.testing.expect(with_configured_scope_seen_match);
     try std.testing.expect(hub.currentScope().tags.get("scope") == null);
 
     global_integration_lookup_called = false;
