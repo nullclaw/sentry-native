@@ -37,29 +37,21 @@ pub const Transport = struct {
         var client: std.http.Client = .{ .allocator = self.allocator };
         defer client.deinit();
 
-        const uri = std.Uri.parse(self.envelope_url) catch return error.InvalidUri;
-
-        var header_buf: [4096]u8 = undefined;
-        var req = try client.open(.POST, uri, .{
-            .server_header_buffer = &header_buf,
+        const result = try client.fetch(.{
+            .location = .{ .url = self.envelope_url },
+            .method = .POST,
+            .payload = envelope_data,
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "application/x-sentry-envelope" },
                 .{ .name = "User-Agent", .value = self.user_agent },
             },
         });
-        defer req.deinit();
 
-        req.transfer_encoding = .{ .content_length = envelope_data.len };
-        try req.send();
-        try req.writeAll(envelope_data);
-        try req.finish();
-        try req.wait();
-
-        const status_code: u16 = @intFromEnum(req.status);
+        const status_code: u16 = @intFromEnum(result.status);
 
         var retry_after: ?u64 = null;
         if (status_code == 429) {
-            // Try to parse Retry-After header, default to 60s
+            // Default to 60s retry-after for rate-limited responses
             retry_after = 60;
         }
 
