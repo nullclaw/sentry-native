@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
+const json = std.json;
 const Writer = std.io.Writer;
 
 const Uuid = @import("uuid.zig").Uuid;
@@ -181,9 +182,8 @@ pub const Transaction = struct {
 
         try w.writeAll("{\"type\":\"transaction\"");
 
-        try w.writeAll(",\"transaction\":\"");
-        try w.writeAll(self.name);
-        try w.writeByte('"');
+        try w.writeAll(",\"transaction\":");
+        try json.Stringify.value(self.name, .{}, w);
 
         try w.print(",\"start_timestamp\":{d:.3}", .{self.start_timestamp});
 
@@ -198,9 +198,8 @@ pub const Transaction = struct {
         try w.writeAll(&self.span_id);
         try w.writeByte('"');
         if (self.op) |op| {
-            try w.writeAll(",\"op\":\"");
-            try w.writeAll(op);
-            try w.writeByte('"');
+            try w.writeAll(",\"op\":");
+            try json.Stringify.value(op, .{}, w);
         }
         if (self.status) |status| {
             try w.writeAll(",\"status\":\"");
@@ -210,15 +209,13 @@ pub const Transaction = struct {
         try w.writeAll("}}");
 
         if (self.release) |release| {
-            try w.writeAll(",\"release\":\"");
-            try w.writeAll(release);
-            try w.writeByte('"');
+            try w.writeAll(",\"release\":");
+            try json.Stringify.value(release, .{}, w);
         }
 
         if (self.environment) |env| {
-            try w.writeAll(",\"environment\":\"");
-            try w.writeAll(env);
-            try w.writeByte('"');
+            try w.writeAll(",\"environment\":");
+            try json.Stringify.value(env, .{}, w);
         }
 
         // Spans array
@@ -250,15 +247,13 @@ fn writeSpanJson(w: *Writer, span: *const Span) !void {
     }
 
     if (span.op) |op| {
-        try w.writeAll(",\"op\":\"");
-        try w.writeAll(op);
-        try w.writeByte('"');
+        try w.writeAll(",\"op\":");
+        try json.Stringify.value(op, .{}, w);
     }
 
     if (span.description) |desc| {
-        try w.writeAll(",\"description\":\"");
-        try w.writeAll(desc);
-        try w.writeByte('"');
+        try w.writeAll(",\"description\":");
+        try json.Stringify.value(desc, .{}, w);
     }
 
     try w.print(",\"start_timestamp\":{d:.3}", .{span.start_timestamp});

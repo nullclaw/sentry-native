@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
+const json = std.json;
 const Writer = std.io.Writer;
 
 const Uuid = @import("uuid.zig").Uuid;
@@ -90,9 +91,8 @@ pub const Session = struct {
         try w.writeByte('"');
 
         if (self.did) |did| {
-            try w.writeAll(",\"did\":\"");
-            try w.writeAll(did);
-            try w.writeByte('"');
+            try w.writeAll(",\"did\":");
+            try json.Stringify.value(did, .{}, w);
         }
 
         if (self.init_flag) {
@@ -121,11 +121,11 @@ pub const Session = struct {
             try w.print(",\"duration\":{d:.3}", .{dur});
         }
 
-        try w.writeAll(",\"attrs\":{\"release\":\"");
-        try w.writeAll(self.release);
-        try w.writeAll("\",\"environment\":\"");
-        try w.writeAll(self.environment);
-        try w.writeAll("\"}}");
+        try w.writeAll(",\"attrs\":{\"release\":");
+        try json.Stringify.value(self.release, .{}, w);
+        try w.writeAll(",\"environment\":");
+        try json.Stringify.value(self.environment, .{}, w);
+        try w.writeAll("}}");
 
         return try aw.toOwnedSlice();
     }

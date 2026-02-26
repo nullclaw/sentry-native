@@ -15,29 +15,31 @@ pub const Transport = struct {
     dsn: Dsn,
     envelope_url: []u8, // allocated
     user_agent: []const u8 = "sentry-zig/0.1.0",
+    http_client: std.http.Client,
 
     /// Initialize a Transport from a parsed Dsn.
     pub fn init(allocator: Allocator, dsn: Dsn) !Transport {
-        const envelope_url = try dsn.getEnvelopeUrl(allocator);
+        const base_url = try dsn.getEnvelopeUrl(allocator);
+        defer allocator.free(base_url);
+        const envelope_url = try std.fmt.allocPrint(allocator, "{s}?sentry_key={s}", .{ base_url, dsn.public_key });
         return Transport{
             .allocator = allocator,
             .dsn = dsn,
             .envelope_url = envelope_url,
+            .http_client = .{ .allocator = allocator },
         };
     }
 
     /// Free allocated resources.
     pub fn deinit(self: *Transport) void {
+        self.http_client.deinit();
         self.allocator.free(self.envelope_url);
         self.* = undefined;
     }
 
     /// Send envelope data to the Sentry endpoint via HTTP POST.
     pub fn send(self: *Transport, envelope_data: []const u8) !SendResult {
-        var client: std.http.Client = .{ .allocator = self.allocator };
-        defer client.deinit();
-
-        const result = try client.fetch(.{
+        const result = try self.http_client.fetch(.{
             .location = .{ .url = self.envelope_url },
             .method = .POST,
             .payload = envelope_data,
@@ -151,6 +153,6 @@ test "Transport init and deinit" {
     var transport = try Transport.init(testing.allocator, dsn);
     defer transport.deinit();
 
-    try testing.expectEqualStrings("https://o0.ingest.sentry.io/api/1234567/envelope/", transport.envelope_url);
+    try testing.expectEqualStrings("https://o0.ingest.sentry.io/api/1234567/envelope/?sentry_key=examplePublicKey", transport.envelope_url);
     try testing.expectEqualStrings("sentry-zig/0.1.0", transport.user_agent);
 }

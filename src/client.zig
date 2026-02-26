@@ -152,6 +152,35 @@ pub const Client = struct {
         // Apply scope to event
         self.scope.applyToEvent(self.allocator, event) catch return;
 
+        // Free allocations made by applyToEvent after we are done with the event
+        defer {
+            if (event.tags) |t| {
+                if (t == .object) {
+                    var obj = t.object;
+                    obj.deinit();
+                    event.tags = null;
+                }
+            }
+            if (event.extra) |e| {
+                if (e == .object) {
+                    var obj = e.object;
+                    obj.deinit();
+                    event.extra = null;
+                }
+            }
+            if (event.contexts) |c| {
+                if (c == .object) {
+                    var obj = c.object;
+                    obj.deinit();
+                    event.contexts = null;
+                }
+            }
+            if (event.breadcrumbs) |b| {
+                self.allocator.free(b);
+                event.breadcrumbs = null;
+            }
+        }
+
         // Run before_send callback
         if (self.options.before_send) |before_send| {
             if (before_send(event) == null) return; // event dropped
@@ -294,23 +323,33 @@ pub const Client = struct {
 
     fn transportSendCallback(data: []const u8, ctx: ?*anyopaque) void {
         if (ctx) |ptr| {
-            const transport: *Transport = @ptrCast(@alignCast(ptr));
-            _ = transport.send(data) catch {};
+            const client: *Client = @ptrCast(@alignCast(ptr));
+            _ = client.transport.send(data) catch {};
         }
     }
 
     fn captureCrashEvent(self: *Client, signal_num: u32) void {
         var event = Event.init();
         event.level = .fatal;
-        event.message = Message{
-            .formatted = "Crash detected from previous run",
+
+        var msg_buf: [64]u8 = undefined;
+        const sig_name: []const u8 = switch (signal_num) {
+            11 => "SIGSEGV",
+            6 => "SIGABRT",
+            7 => "SIGBUS",
+            4 => "SIGILL",
+            8 => "SIGFPE",
+            else => "Unknown",
         };
+        const msg = std.fmt.bufPrint(&msg_buf, "Crash: {s} (signal {d})", .{ sig_name, signal_num }) catch "Crash detected from previous run";
 
-        // Add signal info as tag
-        var tag_buf: [16]u8 = undefined;
-        const tag_str = std.fmt.bufPrint(&tag_buf, "{d}", .{signal_num}) catch "unknown";
-        self.scope.setTag("signal", tag_str) catch {};
-
+        // Use exception interface with stack-local values — safe because captureEvent
+        // serializes synchronously before returning
+        const values = [_]ExceptionValue{.{
+            .@"type" = "NativeCrash",
+            .value = msg,
+        }};
+        event.exception = .{ .values = &values };
         self.captureEvent(&event);
     }
 

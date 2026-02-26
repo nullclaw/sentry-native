@@ -20,7 +20,8 @@ pub const BreadcrumbBuffer = struct {
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, capacity: usize) !BreadcrumbBuffer {
-        const cap = if (capacity > MAX_BREADCRUMBS) MAX_BREADCRUMBS else capacity;
+        const clamped = if (capacity > MAX_BREADCRUMBS) MAX_BREADCRUMBS else capacity;
+        const cap = if (clamped == 0) 1 else clamped; // at least 1 to avoid division by zero
         const buf = try allocator.alloc(Breadcrumb, cap);
         return BreadcrumbBuffer{
             .buffer = buf,
