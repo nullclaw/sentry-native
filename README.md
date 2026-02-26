@@ -42,6 +42,12 @@ Add dependency:
 zig fetch --save git+https://github.com/nullclaw/sentry-zig.git
 ```
 
+For reproducible production builds, pin to a release tag:
+
+```sh
+zig fetch --save https://github.com/nullclaw/sentry-zig/archive/refs/tags/v0.1.0.tar.gz
+```
+
 Import module in `build.zig`:
 
 ```zig
@@ -51,6 +57,12 @@ const sentry_dep = b.dependency("sentry-zig", .{
 });
 exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 ```
+
+## Versioning and Releases
+
+- Current stable release: `v0.1.0`
+- Versioning policy: Semantic Versioning (SemVer)
+- Use release tags for pinned dependencies and deterministic CI/CD builds.
 
 ## Core Concepts
 

@@ -50,6 +50,12 @@ pub fn main() !void {
 zig fetch --save git+https://github.com/nullclaw/sentry-zig.git
 ```
 
+For reproducible production builds, pin to a release tag:
+
+```sh
+zig fetch --save https://github.com/nullclaw/sentry-zig/archive/refs/tags/v0.1.0.tar.gz
+```
+
 ```zig
 const sentry_dep = b.dependency("sentry-zig", .{
     .target = target,
@@ -57,6 +63,8 @@ const sentry_dep = b.dependency("sentry-zig", .{
 });
 exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 ```
+
+Current stable release: `v0.1.0` (SemVer tags).
 
 ## Client Lifecycle
 
