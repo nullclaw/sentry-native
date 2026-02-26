@@ -72,14 +72,22 @@ pub const Transport = struct {
         const arena = self.proxy_arena.allocator();
 
         if (options.http_proxy) |raw_http_proxy| {
-            self.http_client.http_proxy = try parseProxy(arena, raw_http_proxy);
+            if (!isBlankProxy(raw_http_proxy)) {
+                self.http_client.http_proxy = try parseProxy(arena, raw_http_proxy);
+            }
         }
         if (options.https_proxy) |raw_https_proxy| {
-            self.http_client.https_proxy = try parseProxy(arena, raw_https_proxy);
+            if (!isBlankProxy(raw_https_proxy)) {
+                self.http_client.https_proxy = try parseProxy(arena, raw_https_proxy);
+            }
         }
 
         // Fill remaining values from standard proxy env vars.
         self.http_client.initDefaultProxies(arena) catch {};
+    }
+
+    fn isBlankProxy(raw_proxy_url: []const u8) bool {
+        return std.mem.trim(u8, raw_proxy_url, " \t\r\n").len == 0;
     }
 
     fn parseProxy(arena: Allocator, raw_proxy_url: []const u8) !*std.http.Client.Proxy {
@@ -415,4 +423,16 @@ test "Transport init fails for invalid proxy URL" {
             .http_proxy = "://invalid-proxy",
         }),
     );
+}
+
+test "Transport ignores empty proxy strings" {
+    const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
+    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.1.0", .{
+        .http_proxy = "",
+        .https_proxy = " \t",
+    });
+    defer transport.deinit();
+
+    try testing.expect(transport.http_client.http_proxy == null);
+    try testing.expect(transport.http_client.https_proxy == null);
 }

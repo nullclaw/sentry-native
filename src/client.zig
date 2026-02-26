@@ -1433,6 +1433,44 @@ test "Client init fails for invalid proxy URL" {
     );
 }
 
+test "Client init accepts empty proxy URLs" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .http_proxy = "",
+        .https_proxy = " \t",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+}
+
+const ConcurrentInitState = struct {
+    success: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn concurrentClientInitWorker(state: *ConcurrentInitState) void {
+    const client = Client.init(std.heap.page_allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    }) catch return;
+    defer client.deinit();
+
+    state.success.store(true, .seq_cst);
+}
+
+test "Client init supports concurrent initialization" {
+    const main_client = try Client.init(std.heap.page_allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .install_signal_handlers = false,
+    });
+    defer main_client.deinit();
+
+    var state = ConcurrentInitState{};
+    const thread = try std.Thread.spawn(.{}, concurrentClientInitWorker, .{&state});
+    thread.join();
+
+    try testing.expect(state.success.load(.seq_cst));
+}
+
 test "Client runs configured integration setup callbacks on init" {
     var called = false;
     const integration = Integration{
@@ -1518,6 +1556,12 @@ fn dropBreadcrumb(_: Breadcrumb) ?Breadcrumb {
     return null;
 }
 
+fn rewriteBreadcrumb(crumb: Breadcrumb) ?Breadcrumb {
+    var updated = crumb;
+    updated.message = "Testing aha!";
+    return updated;
+}
+
 var replacement_event_for_test: Event = undefined;
 var replacement_txn_for_test: Transaction = undefined;
 var replacement_log_for_test: LogEntry = undefined;
@@ -1548,6 +1592,11 @@ fn dropLogBeforeSend(_: *LogEntry) ?*LogEntry {
 
 fn dropEventInScope(_: *Event) bool {
     return false;
+}
+
+fn setLoggerBeforeSend(event: *Event) ?*Event {
+    event.logger = "muh_logger";
+    return event;
 }
 
 fn alwaysSampleTraces(_: TracesSamplingContext) f64 {
@@ -1694,6 +1743,57 @@ test "Client addBreadcrumb applies before_breadcrumb callback" {
 
     client.addBreadcrumb(.{ .message = "should-drop" });
     try testing.expectEqual(@as(usize, 0), client.scope.breadcrumbs.count);
+}
+
+test "Client before callbacks can mutate breadcrumb and event" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send = setLoggerBeforeSend,
+        .before_breadcrumb = rewriteBreadcrumb,
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.addBreadcrumb(.{ .message = "Testing" });
+    try testing.expect(client.captureMessageId("Hello World!", .warning) != null);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"logger\":\"muh_logger\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "Testing aha!") != null);
+}
+
+test "Client before_breadcrumb can drop breadcrumb while keeping event" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_breadcrumb = dropBreadcrumb,
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.addBreadcrumb(.{ .message = "drop-me-breadcrumb" });
+    try testing.expect(client.captureMessageId("Hello World!", .warning) != null);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"type\":\"event\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "drop-me-breadcrumb") == null);
 }
 
 test "Client clearBreadcrumbs removes previously added breadcrumbs" {
