@@ -835,6 +835,11 @@ pub const Client = struct {
         return propagation.mergeBaggageAlloc(allocator, txn.incoming_baggage, dsc);
     }
 
+    /// Build `sentry-trace` header value from the client's current scope propagation context.
+    pub fn scopeSentryTraceHeader(self: *Client, allocator: Allocator) ![]u8 {
+        return self.scope.sentryTraceHeaderAlloc(allocator);
+    }
+
     /// Finish a transaction, serialize it, and submit the envelope to the worker.
     pub fn finishTransaction(self: *Client, txn: *Transaction) void {
         self.finishTransactionWithScope(txn, &self.scope);
@@ -3149,6 +3154,16 @@ test "Client sentryTraceHeader and baggageHeader include expected values" {
     try testing.expect(std.mem.indexOf(u8, baggage, "sentry-public_key=examplePublicKey") != null);
     try testing.expect(std.mem.indexOf(u8, baggage, "sentry-release=my-app%401.0.0") != null);
     try testing.expect(std.mem.indexOf(u8, baggage, "sentry-environment=staging") != null);
+
+    client.setSpan(.{ .transaction = &txn });
+    const scope_sentry_trace = try client.scopeSentryTraceHeader(testing.allocator);
+    defer testing.allocator.free(scope_sentry_trace);
+    const expected_scope_trace = try std.fmt.allocPrint(testing.allocator, "{s}-{s}", .{ txn.trace_id[0..], txn.span_id[0..] });
+    defer testing.allocator.free(expected_scope_trace);
+    try testing.expectEqualStrings(
+        expected_scope_trace,
+        scope_sentry_trace,
+    );
 }
 
 test "Client baggageHeader preserves third-party incoming baggage members" {

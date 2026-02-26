@@ -11,6 +11,7 @@ const Breadcrumb = event_mod.Breadcrumb;
 const Attachment = @import("attachment.zig").Attachment;
 const Uuid = @import("uuid.zig").Uuid;
 const ts = @import("timestamp.zig");
+const propagation = @import("propagation.zig");
 
 pub const MAX_BREADCRUMBS = 200;
 pub const EventProcessor = *const fn (*Event) bool;
@@ -543,6 +544,16 @@ pub const Scope = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.propagation_context;
+    }
+
+    /// Build `sentry-trace` header from scope propagation context.
+    pub fn sentryTraceHeaderAlloc(self: *Scope, allocator: Allocator) ![]u8 {
+        const context = self.getPropagationContext();
+        return propagation.formatSentryTraceAlloc(allocator, .{
+            .trace_id = context.trace_id,
+            .span_id = context.span_id,
+            .sampled = null,
+        });
     }
 
     /// Set transaction name override for events in this scope.
@@ -1173,6 +1184,23 @@ test "Scope propagation context can be set and reset" {
     scope.resetPropagationContext();
     const reset = scope.getPropagationContext();
     try testing.expect(!std.mem.eql(u8, original.trace_id[0..], reset.trace_id[0..]) or !std.mem.eql(u8, original.span_id[0..], reset.span_id[0..]));
+}
+
+test "Scope sentryTraceHeaderAlloc uses propagation context values" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    const trace_id: [32]u8 = "0123456789abcdef0123456789abcdef".*;
+    const span_id: [16]u8 = "89abcdef01234567".*;
+    scope.setPropagationContext(trace_id, span_id);
+
+    const header = try scope.sentryTraceHeaderAlloc(testing.allocator);
+    defer testing.allocator.free(header);
+
+    try testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef-89abcdef01234567",
+        header,
+    );
 }
 
 test "Scope applyToEvent" {
