@@ -298,3 +298,13 @@ test "Transport stores accept_invalid_certs option" {
 
     try testing.expect(transport.accept_invalid_certs);
 }
+
+test "Transport init fails for invalid proxy URL" {
+    const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
+    try testing.expectError(
+        error.InvalidProxyUrl,
+        Transport.init(testing.allocator, dsn, "sentry-zig/0.1.0", .{
+            .http_proxy = "://invalid-proxy",
+        }),
+    );
+}

@@ -1186,6 +1186,17 @@ test "Options struct size is non-zero" {
     try testing.expect(@sizeOf(Options) > 0);
 }
 
+test "Client init fails for invalid proxy URL" {
+    try testing.expectError(
+        error.InvalidProxyUrl,
+        Client.init(testing.allocator, .{
+            .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+            .http_proxy = "://invalid-proxy",
+            .install_signal_handlers = false,
+        }),
+    );
+}
+
 test "Client runs configured integration setup callbacks on init" {
     var called = false;
     const integration = Integration{
