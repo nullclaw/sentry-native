@@ -10,6 +10,11 @@ pub const envelope = @import("envelope.zig");
 pub const Scope = @import("scope.zig").Scope;
 pub const Session = @import("session.zig").Session;
 pub const SessionStatus = @import("session.zig").SessionStatus;
+pub const Transaction = @import("transaction.zig").Transaction;
+pub const Span = @import("transaction.zig").Span;
+pub const SpanStatus = @import("transaction.zig").SpanStatus;
+pub const TransactionOpts = @import("transaction.zig").TransactionOpts;
+pub const ChildSpanOpts = @import("transaction.zig").ChildSpanOpts;
 
 test {
     @import("std").testing.refAllDecls(@This());
