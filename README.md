@@ -1,6 +1,6 @@
 # Sentry-Zig
 
-Native Sentry SDK in Zig (`0.15.x`) for capturing errors, transactions, sessions,
+Native Sentry SDK in Zig (`0.15.2+`) for capturing errors, transactions, sessions,
 and monitor check-ins via the Sentry Envelope protocol.
 
 This repository focuses on a clean public API, production-safe defaults, and
@@ -32,7 +32,7 @@ pub fn main() !void {
 
 ## Requirements
 
-- Zig `>= 0.15.0`
+- Zig `>= 0.15.2`
 
 ## Installation
 

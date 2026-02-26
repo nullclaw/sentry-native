@@ -1,6 +1,18 @@
 //! Sentry-Zig: Pure Zig Sentry SDK
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+comptime {
+    const minimum = std.SemanticVersion{
+        .major = 0,
+        .minor = 15,
+        .patch = 2,
+    };
+    if (builtin.zig_version.order(minimum) == .lt) {
+        @compileError("sentry-zig requires Zig >= 0.15.2");
+    }
+}
 
 pub const Client = @import("client.zig").Client;
 pub const Options = @import("client.zig").Options;
