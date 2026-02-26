@@ -114,6 +114,7 @@ pub fn parseSentryRateLimitsHeader(header_value: []const u8) Update {
         var parts = std.mem.splitScalar(u8, trimmed_group, ':');
         const seconds_str = parts.next() orelse continue;
         const categories_field = parts.next() orelse continue;
+        _ = parts.next() orelse continue; // scope (required by the envelope header grammar)
         const seconds = parseRetryAfterHeader(seconds_str) orelse continue;
 
         const categories = std.mem.trim(u8, categories_field, " \t");
@@ -141,6 +142,7 @@ fn parseCategory(category_raw: []const u8) ?Category {
     const category = std.mem.trim(u8, category_raw, " \t");
     if (category.len == 0) return null;
 
+    if (std.ascii.eqlIgnoreCase(category, "default")) return .@"error";
     if (std.ascii.eqlIgnoreCase(category, "error")) return .@"error";
     if (std.ascii.eqlIgnoreCase(category, "session")) return .session;
     if (std.ascii.eqlIgnoreCase(category, "transaction")) return .transaction;
@@ -197,10 +199,20 @@ test "parseSentryRateLimitsHeader parses categories and global entries" {
     try testing.expectEqual(@as(?u64, 240), update.any);
 }
 
+test "parseSentryRateLimitsHeader maps default category to error events" {
+    const update = parseSentryRateLimitsHeader("42:default:project");
+    try testing.expectEqual(@as(?u64, 42), update.@"error");
+}
+
 test "parseSentryRateLimitsHeader ignores unsupported categories" {
     const update = parseSentryRateLimitsHeader("120:security:org, 60:error:org");
     try testing.expectEqual(@as(?u64, null), update.session);
     try testing.expectEqual(@as(?u64, 60), update.@"error");
+}
+
+test "parseSentryRateLimitsHeader requires scope segment" {
+    const update = parseSentryRateLimitsHeader("120:error");
+    try testing.expect(update.isEmpty());
 }
 
 test "State applies global and category limits" {
@@ -217,4 +229,32 @@ test "State applies global and category limits" {
     try testing.expect(state.isEnabled(.@"error", 103 * std.time.ns_per_s));
     try testing.expect(!state.isEnabled(.transaction, 103 * std.time.ns_per_s));
     try testing.expect(state.isEnabled(.transaction, 106 * std.time.ns_per_s));
+}
+
+test "rate limit state mirrors sentry-rust header semantics" {
+    var state: State = .{};
+    const now = 500 * std.time.ns_per_s;
+
+    state.applyUpdate(
+        parseSentryRateLimitsHeader("120:error:project:reason, 60:session:foo"),
+        now,
+    );
+
+    try testing.expect(!state.isEnabled(.@"error", now + std.time.ns_per_s));
+    try testing.expect(!state.isEnabled(.session, now + std.time.ns_per_s));
+    try testing.expect(state.isEnabled(.transaction, now + std.time.ns_per_s));
+    try testing.expect(state.isEnabled(.log_item, now + std.time.ns_per_s));
+
+    state.applyUpdate(
+        parseSentryRateLimitsHeader(
+            \\30::bar,
+            \\120:invalid:invalid,
+            \\4711:foo;bar;baz;security:project
+        ),
+        now,
+    );
+
+    // Empty categories apply a global limit.
+    try testing.expect(!state.isEnabled(.transaction, now + std.time.ns_per_s));
+    try testing.expect(!state.isEnabled(.any, now + std.time.ns_per_s));
 }

@@ -43,10 +43,16 @@ pub const Session = struct {
     release: []const u8,
     environment: []const u8,
     duration: ?f64 = null,
+    track_duration: bool = true,
     dirty: bool = true,
 
     /// Create a new session with the given release and environment.
     pub fn start(release: []const u8, environment: []const u8) Session {
+        return startWithMode(release, environment, true);
+    }
+
+    /// Create a session and optionally disable duration tracking (request mode parity).
+    pub fn startWithMode(release: []const u8, environment: []const u8, track_duration: bool) Session {
         const uuid = Uuid.v4();
         const now = ts.now();
         return Session{
@@ -55,6 +61,7 @@ pub const Session = struct {
             .timestamp = now,
             .release = release,
             .environment = environment,
+            .track_duration = track_duration,
         };
     }
 
@@ -80,7 +87,11 @@ pub const Session = struct {
     pub fn end(self: *Session, status: SessionStatus) void {
         self.status = status;
         self.timestamp = ts.now();
-        self.duration = self.timestamp - self.started;
+        if (self.track_duration) {
+            self.duration = self.timestamp - self.started;
+        } else {
+            self.duration = null;
+        }
         self.dirty = true;
     }
 
@@ -191,6 +202,14 @@ test "Session.end sets duration and status" {
     try testing.expectEqual(SessionStatus.exited, session.status);
     try testing.expect(session.duration != null);
     try testing.expect(session.duration.? >= 0.0);
+}
+
+test "Session.startWithMode disables duration in request mode" {
+    var session = Session.startWithMode("app@1.0", "dev", false);
+
+    session.end(.exited);
+    try testing.expectEqual(SessionStatus.exited, session.status);
+    try testing.expect(session.duration == null);
 }
 
 test "Session.toJson produces valid JSON with expected fields" {

@@ -5,6 +5,10 @@
 **Zig Version:** 0.15.2
 **Approach:** Pure Zig implementation (no C dependencies)
 
+> Status note (2026-02-26): This is an early design draft kept for context.
+> The implementation in `src/` is the source of truth; module lists and some
+> capabilities below are not fully up-to-date.
+
 ## Overview
 
 A pure Zig Sentry SDK implementing the Sentry envelope protocol. Designed as a zero-dependency Zig package that integrates with NullClaw's existing architecture (vtable-based polymorphism, allocator-aware, minimal footprint).

@@ -1,8 +1,10 @@
 # Sentry-Zig Implementation Plan
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
-
 **Goal:** Build a pure Zig Sentry SDK (named Sentry-Zig) with full error tracking, performance monitoring, crash reporting, and session tracking.
+
+> Status note (2026-02-26): This document is retained as a historical
+> implementation checklist. The current codebase in `src/` and tests is the
+> authoritative behavior.
 
 **Architecture:** Modular design — each concern (DSN, events, transport, etc.) is a separate file with its own tests. A background worker thread handles async event delivery. The public API is a single `Client` struct in `src/sentry.zig`.
 

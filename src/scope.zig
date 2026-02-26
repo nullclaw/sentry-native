@@ -8,18 +8,31 @@ const Event = event_mod.Event;
 const Level = event_mod.Level;
 const User = event_mod.User;
 const Breadcrumb = event_mod.Breadcrumb;
+const Attachment = @import("attachment.zig").Attachment;
 const ts = @import("timestamp.zig");
 
 pub const MAX_BREADCRUMBS = 200;
+pub const EventProcessor = *const fn (*Event) bool;
 
 pub const ApplyResult = struct {
     level_applied: bool = false,
     user_allocated: bool = false,
+    transaction_allocated: bool = false,
+    fingerprint_allocated: bool = false,
     tags_allocated: bool = false,
     extra_allocated: bool = false,
     contexts_allocated: bool = false,
     breadcrumbs_allocated: bool = false,
+    applied_user: ?User = null,
+    applied_transaction: ?[]const u8 = null,
+    applied_fingerprint: ?[][]const u8 = null,
+    applied_tags: ?json.Value = null,
+    applied_extra: ?json.Value = null,
+    applied_contexts: ?json.Value = null,
+    applied_breadcrumbs: ?[]Breadcrumb = null,
     previous_level: ?Level = null,
+    previous_transaction: ?[]const u8 = null,
+    previous_fingerprint: ?[]const []const u8 = null,
     previous_tags: ?json.Value = null,
     previous_extra: ?json.Value = null,
     previous_contexts: ?json.Value = null,
@@ -282,14 +295,50 @@ fn deinitJsonMapOwned(allocator: Allocator, map: *std.StringHashMap(json.Value))
     map.deinit();
 }
 
+pub fn deinitAttachmentSlice(allocator: Allocator, attachments: []Attachment) void {
+    for (attachments) |*attachment| {
+        attachment.deinit(allocator);
+    }
+    allocator.free(attachments);
+}
+
+fn cloneStringSlice(allocator: Allocator, values: []const []const u8) ![][]const u8 {
+    const cloned = try allocator.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |item| {
+            allocator.free(@constCast(item));
+        }
+        allocator.free(cloned);
+    }
+
+    for (values) |value| {
+        cloned[initialized] = try allocator.dupe(u8, value);
+        initialized += 1;
+    }
+
+    return cloned;
+}
+
+fn deinitStringSlice(allocator: Allocator, values: [][]const u8) void {
+    for (values) |value| {
+        allocator.free(@constCast(value));
+    }
+    allocator.free(values);
+}
+
 /// The Scope holds mutable state applied to every event.
 pub const Scope = struct {
     allocator: Allocator,
     level: ?Level = null,
     user: ?User = null,
+    transaction: ?[]const u8 = null,
+    fingerprint: std.ArrayListUnmanaged([]const u8) = .{},
     tags: std.StringHashMap([]const u8),
     extra: std.StringHashMap(json.Value),
     contexts: std.StringHashMap(json.Value),
+    attachments: std.ArrayListUnmanaged(Attachment) = .{},
+    event_processors: std.ArrayListUnmanaged(EventProcessor) = .{},
     breadcrumbs: BreadcrumbBuffer,
     mutex: std.Thread.Mutex = .{},
 
@@ -308,10 +357,19 @@ pub const Scope = struct {
             deinitUserDeep(self.allocator, u);
             self.user = null;
         }
+        if (self.transaction) |transaction| {
+            self.allocator.free(@constCast(transaction));
+            self.transaction = null;
+        }
+        self.clearFingerprintOwned();
+        self.fingerprint.deinit(self.allocator);
 
         deinitTagMapOwned(self.allocator, &self.tags);
         deinitJsonMapOwned(self.allocator, &self.extra);
         deinitJsonMapOwned(self.allocator, &self.contexts);
+        self.clearAttachmentsOwned();
+        self.attachments.deinit(self.allocator);
+        self.event_processors.deinit(self.allocator);
         self.breadcrumbs.deinit();
         self.* = undefined;
     }
@@ -336,6 +394,35 @@ pub const Scope = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.level = level;
+    }
+
+    /// Set transaction name override for events in this scope.
+    pub fn setTransaction(self: *Scope, transaction: ?[]const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.transaction) |current| {
+            self.allocator.free(@constCast(current));
+            self.transaction = null;
+        }
+
+        if (transaction) |name| {
+            self.transaction = try self.allocator.dupe(u8, name);
+        }
+    }
+
+    /// Set scope fingerprint override.
+    pub fn setFingerprint(self: *Scope, fingerprint: ?[]const []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.clearFingerprintOwned();
+        if (fingerprint) |items| {
+            try self.fingerprint.ensureTotalCapacity(self.allocator, items.len);
+            for (items) |item| {
+                try self.fingerprint.append(self.allocator, try self.allocator.dupe(u8, item));
+            }
+        }
     }
 
     /// Set a tag (thread-safe).
@@ -444,6 +531,59 @@ pub const Scope = struct {
         self.breadcrumbs.push(owned);
     }
 
+    /// Add an attachment to the scope. The scope stores an owned clone.
+    pub fn addAttachment(self: *Scope, attachment: Attachment) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var owned = attachment.clone(self.allocator) catch return;
+        self.attachments.append(self.allocator, owned) catch {
+            owned.deinit(self.allocator);
+        };
+    }
+
+    /// Clear scope attachments.
+    pub fn clearAttachments(self: *Scope) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.clearAttachmentsOwned();
+    }
+
+    /// Add an event processor. Return false from a processor to drop the event.
+    pub fn addEventProcessor(self: *Scope, processor: EventProcessor) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.event_processors.append(self.allocator, processor);
+    }
+
+    /// Clear all configured event processors.
+    pub fn clearEventProcessors(self: *Scope) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.event_processors.clearRetainingCapacity();
+    }
+
+    /// Snapshot attachments into newly allocated owned copies for event capture.
+    pub fn snapshotAttachments(self: *Scope, allocator: Allocator) ![]Attachment {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const out = try allocator.alloc(Attachment, self.attachments.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |*attachment| {
+                attachment.deinit(allocator);
+            }
+            allocator.free(out);
+        }
+
+        for (self.attachments.items) |attachment| {
+            out[initialized] = try attachment.clone(allocator);
+            initialized += 1;
+        }
+        return out;
+    }
+
     /// Apply scope data to an event before sending.
     pub fn applyToEvent(self: *Scope, allocator: Allocator, event: *Event) !ApplyResult {
         self.mutex.lock();
@@ -458,11 +598,29 @@ pub const Scope = struct {
             result.level_applied = true;
         }
 
+        if (event.transaction == null and self.transaction != null) {
+            result.previous_transaction = event.transaction;
+            const cloned_transaction = try allocator.dupe(u8, self.transaction.?);
+            event.transaction = cloned_transaction;
+            result.transaction_allocated = true;
+            result.applied_transaction = cloned_transaction;
+        }
+
+        if (event.fingerprint == null and self.fingerprint.items.len > 0) {
+            result.previous_fingerprint = event.fingerprint;
+            const cloned_fingerprint = try cloneStringSlice(allocator, self.fingerprint.items);
+            event.fingerprint = cloned_fingerprint;
+            result.fingerprint_allocated = true;
+            result.applied_fingerprint = cloned_fingerprint;
+        }
+
         // Apply user only when event user is not set.
         if (event.user == null and self.user != null) {
             const u = self.user.?;
-            event.user = try cloneUser(allocator, u);
+            const cloned_user = try cloneUser(allocator, u);
+            event.user = cloned_user;
             result.user_allocated = true;
+            result.applied_user = cloned_user;
         }
 
         // Merge tags.
@@ -487,6 +645,7 @@ pub const Scope = struct {
             result.previous_tags = event.tags;
             event.tags = .{ .object = obj };
             result.tags_allocated = true;
+            result.applied_tags = event.tags;
         }
 
         // Merge extra.
@@ -511,6 +670,7 @@ pub const Scope = struct {
             result.previous_extra = event.extra;
             event.extra = .{ .object = obj };
             result.extra_allocated = true;
+            result.applied_extra = event.extra;
         }
 
         // Merge contexts.
@@ -535,6 +695,7 @@ pub const Scope = struct {
             result.previous_contexts = event.contexts;
             event.contexts = .{ .object = obj };
             result.contexts_allocated = true;
+            result.applied_contexts = event.contexts;
         }
 
         // Merge breadcrumbs: event breadcrumbs first, scope breadcrumbs after.
@@ -566,6 +727,11 @@ pub const Scope = struct {
             result.previous_breadcrumbs = event.breadcrumbs;
             event.breadcrumbs = crumbs;
             result.breadcrumbs_allocated = true;
+            result.applied_breadcrumbs = crumbs;
+        }
+
+        for (self.event_processors.items) |processor| {
+            if (!processor(event)) return error.EventDropped;
         }
 
         return result;
@@ -580,12 +746,33 @@ pub const Scope = struct {
             deinitUserDeep(self.allocator, u);
             self.user = null;
         }
+        if (self.transaction) |transaction| {
+            self.allocator.free(@constCast(transaction));
+            self.transaction = null;
+        }
         self.level = null;
+        self.clearFingerprintOwned();
 
         clearTagMapOwned(self.allocator, &self.tags);
         clearJsonMapOwned(self.allocator, &self.extra);
         clearJsonMapOwned(self.allocator, &self.contexts);
+        self.clearAttachmentsOwned();
+        self.event_processors.clearRetainingCapacity();
         self.breadcrumbs.clear();
+    }
+
+    fn clearAttachmentsOwned(self: *Scope) void {
+        for (self.attachments.items) |*attachment| {
+            attachment.deinit(self.allocator);
+        }
+        self.attachments.clearRetainingCapacity();
+    }
+
+    fn clearFingerprintOwned(self: *Scope) void {
+        for (self.fingerprint.items) |item| {
+            self.allocator.free(@constCast(item));
+        }
+        self.fingerprint.clearRetainingCapacity();
     }
 };
 
@@ -594,41 +781,58 @@ pub fn cleanupAppliedToEvent(allocator: Allocator, event: *Event, result: ApplyR
         event.level = result.previous_level;
     }
 
-    if (result.user_allocated) {
-        if (event.user) |*u| {
-            deinitUserDeep(allocator, u);
-            event.user = null;
+    if (result.transaction_allocated) {
+        if (result.applied_transaction) |transaction| {
+            allocator.free(@constCast(transaction));
         }
+        event.transaction = result.previous_transaction;
+    }
+
+    if (result.fingerprint_allocated) {
+        if (result.applied_fingerprint) |fingerprint| {
+            deinitStringSlice(allocator, fingerprint);
+        }
+        event.fingerprint = result.previous_fingerprint;
+    }
+
+    if (result.user_allocated) {
+        if (result.applied_user) |user| {
+            var owned_user = user;
+            deinitUserDeep(allocator, &owned_user);
+        }
+        event.user = null;
     }
 
     if (result.tags_allocated) {
-        if (event.tags) |*tags| {
-            deinitJsonValueDeep(allocator, tags);
+        if (result.applied_tags) |tags| {
+            var owned_tags = tags;
+            deinitJsonValueDeep(allocator, &owned_tags);
         }
         event.tags = result.previous_tags;
     }
 
     if (result.extra_allocated) {
-        if (event.extra) |*extra| {
-            deinitJsonValueDeep(allocator, extra);
+        if (result.applied_extra) |extra| {
+            var owned_extra = extra;
+            deinitJsonValueDeep(allocator, &owned_extra);
         }
         event.extra = result.previous_extra;
     }
 
     if (result.contexts_allocated) {
-        if (event.contexts) |*contexts| {
-            deinitJsonValueDeep(allocator, contexts);
+        if (result.applied_contexts) |contexts| {
+            var owned_contexts = contexts;
+            deinitJsonValueDeep(allocator, &owned_contexts);
         }
         event.contexts = result.previous_contexts;
     }
 
     if (result.breadcrumbs_allocated) {
-        if (event.breadcrumbs) |crumbs| {
-            const mutable = @constCast(crumbs);
-            for (mutable) |*crumb| {
+        if (result.applied_breadcrumbs) |crumbs| {
+            for (crumbs) |*crumb| {
                 deinitBreadcrumbDeep(allocator, crumb);
             }
-            allocator.free(mutable);
+            allocator.free(crumbs);
         }
         event.breadcrumbs = result.previous_breadcrumbs;
     }
@@ -772,6 +976,27 @@ test "Scope applyToEvent does not override existing event user" {
     try testing.expect(!applied.user_allocated);
 }
 
+test "Scope applyToEvent sets transaction and fingerprint and restores on cleanup" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    try scope.setTransaction("txn-from-scope");
+    try scope.setFingerprint(&.{ "fp-1", "fp-2" });
+
+    var event = Event.init();
+    const applied = try scope.applyToEvent(testing.allocator, &event);
+
+    try testing.expectEqualStrings("txn-from-scope", event.transaction.?);
+    try testing.expect(event.fingerprint != null);
+    try testing.expectEqual(@as(usize, 2), event.fingerprint.?.len);
+    try testing.expectEqualStrings("fp-1", event.fingerprint.?[0]);
+    try testing.expectEqualStrings("fp-2", event.fingerprint.?[1]);
+
+    cleanupAppliedToEvent(testing.allocator, &event, applied);
+    try testing.expect(event.transaction == null);
+    try testing.expect(event.fingerprint == null);
+}
+
 test "Scope stores owned tag strings" {
     var scope = try Scope.init(testing.allocator, 10);
     defer scope.deinit();
@@ -794,12 +1019,22 @@ test "Scope clear resets all fields" {
     scope.setUser(.{ .id = "user-1" });
     try scope.setTag("key", "value");
     scope.addBreadcrumb(.{ .message = "crumb" });
+    var attachment = try Attachment.initOwned(
+        testing.allocator,
+        "note.txt",
+        "abc",
+        "text/plain",
+        null,
+    );
+    defer attachment.deinit(testing.allocator);
+    scope.addAttachment(attachment);
 
     scope.clear();
 
     try testing.expect(scope.user == null);
     try testing.expectEqual(@as(usize, 0), scope.tags.count());
     try testing.expectEqual(@as(usize, 0), scope.breadcrumbs.count);
+    try testing.expectEqual(@as(usize, 0), scope.attachments.items.len);
 }
 
 test "Scope removeExtra and removeContext remove owned values" {
@@ -860,4 +1095,90 @@ test "Scope applyToEvent rolls back mutations on allocation failure" {
     try testing.expect(event.extra == null);
     try testing.expect(event.contexts == null);
     try testing.expect(event.breadcrumbs == null);
+}
+
+test "cleanupAppliedToEvent is robust when event fields are mutated after apply" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    scope.setUser(.{ .id = "scope-user" });
+    try scope.setTag("scope-tag", "scope-value");
+    try scope.setExtra("scope-extra", .{ .string = "scope" });
+    try scope.setContext("scope-context", .{ .integer = 1 });
+    try scope.setTransaction("scope-txn");
+    try scope.setFingerprint(&.{"scope-fp"});
+    scope.addBreadcrumb(.{ .message = "scope-crumb" });
+
+    var event = Event.init();
+    const applied = try scope.applyToEvent(testing.allocator, &event);
+
+    // Simulate a before_send hook replacing fields with non-owned data.
+    const external_crumbs = [_]Breadcrumb{.{ .message = "external-crumb" }};
+    event.user = .{ .id = "external-user" };
+    event.tags = .{ .string = "external-tags" };
+    event.extra = .{ .string = "external-extra" };
+    event.contexts = .{ .string = "external-contexts" };
+    event.transaction = "external-transaction";
+    event.fingerprint = &.{"external-fingerprint"};
+    event.breadcrumbs = &external_crumbs;
+
+    cleanupAppliedToEvent(testing.allocator, &event, applied);
+
+    try testing.expect(event.user == null);
+    try testing.expect(event.tags == null);
+    try testing.expect(event.extra == null);
+    try testing.expect(event.contexts == null);
+    try testing.expect(event.transaction == null);
+    try testing.expect(event.fingerprint == null);
+    try testing.expect(event.breadcrumbs == null);
+}
+
+test "Scope snapshotAttachments returns owned copies" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    var attachment = try Attachment.initOwned(
+        testing.allocator,
+        "payload.txt",
+        "hello",
+        "text/plain",
+        "event.attachment",
+    );
+    defer attachment.deinit(testing.allocator);
+
+    scope.addAttachment(attachment);
+
+    const snapshot = try scope.snapshotAttachments(testing.allocator);
+    defer deinitAttachmentSlice(testing.allocator, snapshot);
+
+    try testing.expectEqual(@as(usize, 1), snapshot.len);
+    try testing.expectEqualStrings("payload.txt", snapshot[0].filename);
+    try testing.expectEqualStrings("hello", snapshot[0].data);
+    try testing.expectEqualStrings("text/plain", snapshot[0].content_type.?);
+}
+
+fn dropProcessor(_: *Event) bool {
+    return false;
+}
+
+fn mutateProcessor(event: *Event) bool {
+    event.transaction = "processed-transaction";
+    return true;
+}
+
+test "Scope event processors can mutate and drop events" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    try scope.addEventProcessor(mutateProcessor);
+    var event = Event.init();
+    const applied = try scope.applyToEvent(testing.allocator, &event);
+    defer cleanupAppliedToEvent(testing.allocator, &event, applied);
+    try testing.expectEqualStrings("processed-transaction", event.transaction.?);
+
+    scope.clearEventProcessors();
+    try scope.addEventProcessor(dropProcessor);
+
+    var drop_event = Event.init();
+    try testing.expectError(error.EventDropped, scope.applyToEvent(testing.allocator, &drop_event));
 }

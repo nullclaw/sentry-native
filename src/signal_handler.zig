@@ -14,6 +14,7 @@ const CRASH_FILE = ".sentry-zig-crash";
 var crash_file_path: [std.fs.max_path_bytes]u8 = undefined;
 var crash_file_path_len: usize = 0;
 var handlers_installed: bool = false;
+var install_ref_count: usize = 0;
 
 const NUM_SIGNALS = 5;
 
@@ -91,7 +92,11 @@ fn signalHandler(sig: i32) callconv(.c) void {
 /// cache_dir is the directory where the crash file will be written.
 pub fn install(cache_dir: []const u8) void {
     if (!is_posix) return;
-    if (handlers_installed) return;
+
+    if (handlers_installed) {
+        install_ref_count += 1;
+        return;
+    }
 
     // Build the crash file path: cache_dir/CRASH_FILE
     if (cache_dir.len + 1 + CRASH_FILE.len + 1 > crash_file_path.len) return;
@@ -117,6 +122,7 @@ pub fn install(cache_dir: []const u8) void {
     }
 
     handlers_installed = true;
+    install_ref_count = 1;
 }
 
 /// Uninstall signal handlers, restoring previous handlers.
@@ -124,11 +130,18 @@ pub fn uninstall() void {
     if (!is_posix) return;
     if (!handlers_installed) return;
 
+    if (install_ref_count > 1) {
+        install_ref_count -= 1;
+        return;
+    }
+
     for (crash_signals, 0..) |sig, i| {
         std.posix.sigaction(sig, &previous_handlers[i], null);
     }
 
+    install_ref_count = 0;
     handlers_installed = false;
+    crash_file_path_len = 0;
 }
 
 /// Check for a pending crash from a previous run.
@@ -170,16 +183,24 @@ fn parseSignalLine(content: []const u8) ?u32 {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 test "checkPendingCrash returns null when no crash file exists" {
-    const result = checkPendingCrash(testing.allocator, "/tmp/sentry-zig-test-nonexistent");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(dir_path);
+
+    const result = checkPendingCrash(testing.allocator, dir_path);
     try testing.expect(result == null);
 }
 
 test "checkPendingCrash reads and deletes crash file" {
-    const test_dir = "/tmp/sentry-zig-test-crash";
-    const crash_path = test_dir ++ "/" ++ CRASH_FILE;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-    // Ensure test directory exists
-    std.fs.cwd().makePath(test_dir) catch {};
+    const test_dir = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(test_dir);
+    const crash_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ test_dir, CRASH_FILE });
+    defer testing.allocator.free(crash_path);
 
     // Write a fake crash file
     {
@@ -196,27 +217,36 @@ test "checkPendingCrash reads and deletes crash file" {
     // File should be deleted
     const result2 = checkPendingCrash(testing.allocator, test_dir);
     try testing.expect(result2 == null);
-
-    // Cleanup
-    std.fs.cwd().deleteTree(test_dir) catch {};
 }
 
 test "install and uninstall is idempotent" {
     if (!is_posix) return;
 
+    while (install_ref_count > 0) uninstall();
+
     install("/tmp/sentry-zig-test-signals");
     try testing.expect(handlers_installed);
+    try testing.expectEqual(@as(usize, 1), install_ref_count);
 
-    // Install again should be no-op
+    // Install again increments reference count.
     install("/tmp/sentry-zig-test-signals");
     try testing.expect(handlers_installed);
+    try testing.expectEqual(@as(usize, 2), install_ref_count);
 
+    // First uninstall decrements refcount and keeps handlers installed.
+    uninstall();
+    try testing.expect(handlers_installed);
+    try testing.expectEqual(@as(usize, 1), install_ref_count);
+
+    // Final uninstall removes handlers.
     uninstall();
     try testing.expect(!handlers_installed);
+    try testing.expectEqual(@as(usize, 0), install_ref_count);
 
     // Uninstall again should be no-op
     uninstall();
     try testing.expect(!handlers_installed);
+    try testing.expectEqual(@as(usize, 0), install_ref_count);
 }
 
 test "parseSignalLine parses valid signal" {

@@ -19,3 +19,10 @@ It is intentionally ignored by git (except this file and `fetch-sources.sh`).
 ```sh
 ./reference/fetch-sources.sh
 ```
+
+By default, refresh skips repositories with local modifications.
+To force-update and discard local changes in all reference clones:
+
+```sh
+./reference/fetch-sources.sh --hard
+```

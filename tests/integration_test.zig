@@ -7,6 +7,154 @@ const std = @import("std");
 const testing = std.testing;
 const sentry = @import("sentry-zig");
 
+fn dropEventProcessor(_: *sentry.Event) bool {
+    return false;
+}
+
+const CaptureRelay = struct {
+    allocator: std.mem.Allocator,
+    server: std.net.Server,
+    thread: ?std.Thread = null,
+    response_headers: []const std.http.Header,
+    response_status: std.http.Status = .ok,
+    mutex: std.Thread.Mutex = .{},
+    condition: std.Thread.Condition = .{},
+    captured_bodies: std.ArrayListUnmanaged([]u8) = .{},
+    failed: bool = false,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        response_headers: []const std.http.Header,
+    ) !CaptureRelay {
+        const listen_address = try std.net.Address.parseIp("127.0.0.1", 0);
+        return .{
+            .allocator = allocator,
+            .server = try listen_address.listen(.{ .reuse_address = true }),
+            .response_headers = response_headers,
+        };
+    }
+
+    pub fn start(self: *CaptureRelay) !void {
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    pub fn deinit(self: *CaptureRelay) void {
+        self.server.deinit();
+        if (self.thread) |thread| thread.join();
+
+        for (self.captured_bodies.items) |body| {
+            self.allocator.free(body);
+        }
+        self.captured_bodies.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn port(self: *const CaptureRelay) u16 {
+        return self.server.listen_address.getPort();
+    }
+
+    pub fn waitForAtLeast(self: *CaptureRelay, min_requests: usize, timeout_ms: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const timeout_ns: i128 = @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
+        const deadline = std.time.nanoTimestamp() + timeout_ns;
+
+        while (!self.failed and self.captured_bodies.items.len < min_requests) {
+            const now = std.time.nanoTimestamp();
+            if (now >= deadline) return false;
+            const remaining: u64 = @intCast(deadline - now);
+            self.condition.timedWait(&self.mutex, remaining) catch {};
+        }
+
+        return !self.failed and self.captured_bodies.items.len >= min_requests;
+    }
+
+    pub fn requestCount(self: *CaptureRelay) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.captured_bodies.items.len;
+    }
+
+    pub fn containsInAny(self: *CaptureRelay, needle: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.captured_bodies.items) |body| {
+            if (std.mem.indexOf(u8, body, needle) != null) return true;
+        }
+        return false;
+    }
+
+    fn markFailed(self: *CaptureRelay) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.failed = true;
+        self.condition.broadcast();
+    }
+
+    fn serve(self: *CaptureRelay) void {
+        while (true) {
+            const connection = self.server.accept() catch return;
+            self.handleConnection(connection);
+        }
+    }
+
+    fn handleConnection(self: *CaptureRelay, connection: std.net.Server.Connection) void {
+        defer connection.stream.close();
+
+        var send_buffer: [8192]u8 = undefined;
+        var recv_buffer: [8192]u8 = undefined;
+        var connection_reader = connection.stream.reader(&recv_buffer);
+        var connection_writer = connection.stream.writer(&send_buffer);
+        var http_server: std.http.Server = .init(connection_reader.interface(), &connection_writer.interface);
+
+        var request = http_server.receiveHead() catch |err| switch (err) {
+            error.HttpConnectionClosing => return,
+            else => {
+                self.markFailed();
+                return;
+            },
+        };
+
+        var body_read_buffer: [2048]u8 = undefined;
+        const body_reader = request.readerExpectContinue(&body_read_buffer) catch {
+            self.markFailed();
+            return;
+        };
+        const content_length = request.head.content_length orelse 0;
+        const body = body_reader.readAlloc(self.allocator, @intCast(content_length)) catch {
+            self.markFailed();
+            return;
+        };
+
+        self.mutex.lock();
+        if (self.captured_bodies.append(self.allocator, body)) |_| {
+            self.condition.broadcast();
+        } else |_| {
+            self.allocator.free(body);
+            self.failed = true;
+            self.condition.broadcast();
+            self.mutex.unlock();
+            return;
+        }
+        self.mutex.unlock();
+
+        request.respond("ok", .{
+            .status = self.response_status,
+            .keep_alive = false,
+            .extra_headers = self.response_headers,
+        }) catch {
+            self.markFailed();
+            return;
+        };
+    }
+};
+
+fn makeLocalDsn(allocator: std.mem.Allocator, port: u16) ![]u8 {
+    return std.fmt.allocPrint(allocator, "http://testkey@127.0.0.1:{d}/99999", .{port});
+}
+
 // ─── 1. DSN Parsing and Envelope URL ────────────────────────────────────────
 
 test "DSN parsing and envelope URL" {
@@ -149,6 +297,33 @@ test "Scope enriches events with user, tags, and breadcrumbs" {
     try testing.expectEqual(@as(usize, 2), event.breadcrumbs.?.len);
     try testing.expectEqualStrings("User clicked button", event.breadcrumbs.?[0].message.?);
     try testing.expectEqualStrings("API call made", event.breadcrumbs.?[1].message.?);
+}
+
+test "Scope enriches events with transaction and fingerprint overrides" {
+    var scope = try sentry.Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    try scope.setTransaction("scope-transaction");
+    try scope.setFingerprint(&.{ "group-a", "group-b" });
+
+    var event = sentry.Event.init();
+    const applied = try scope.applyToEvent(testing.allocator, &event);
+    defer sentry.cleanupAppliedToEvent(testing.allocator, &event, applied);
+
+    try testing.expectEqualStrings("scope-transaction", event.transaction.?);
+    try testing.expect(event.fingerprint != null);
+    try testing.expectEqual(@as(usize, 2), event.fingerprint.?.len);
+    try testing.expectEqualStrings("group-a", event.fingerprint.?[0]);
+}
+
+test "Scope event processor can drop event during apply" {
+    var scope = try sentry.Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    try scope.addEventProcessor(dropEventProcessor);
+
+    var event = sentry.Event.init();
+    try testing.expectError(error.EventDropped, scope.applyToEvent(testing.allocator, &event));
 }
 
 // ─── 4. UUID v4 Format ─────────────────────────────────────────────────────
@@ -322,7 +497,262 @@ test "Envelope serialization produces 3-line format" {
     try testing.expectEqual(declared_length, line3.len);
 }
 
-// ─── 8. Timestamp Formatting ────────────────────────────────────────────────
+test "Envelope serialization with attachment includes attachment item" {
+    const dsn = try sentry.Dsn.parse("https://testkey@o0.ingest.sentry.io/99999");
+    const event = sentry.Event.initMessage("attachment envelope test", .info);
+
+    var attachment = try sentry.Attachment.initOwned(
+        testing.allocator,
+        "trace.txt",
+        "trace-body",
+        "text/plain",
+        "event.attachment",
+    );
+    defer attachment.deinit(testing.allocator);
+
+    var aw: std.io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try sentry.envelope.serializeEventEnvelopeWithAttachments(
+        testing.allocator,
+        event,
+        dsn,
+        &.{attachment},
+        &aw.writer,
+    );
+    const output = aw.written();
+
+    try testing.expect(std.mem.indexOf(u8, output, "\"type\":\"attachment\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"filename\":\"trace.txt\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "trace-body") != null);
+}
+
+test "Monitor check-in JSON serialization" {
+    var check_in = sentry.MonitorCheckIn.init("nightly", .ok);
+    check_in.environment = "production";
+    check_in.duration = 1.5;
+
+    const payload = try check_in.toJson(testing.allocator);
+    defer testing.allocator.free(payload);
+
+    try testing.expect(std.mem.indexOf(u8, payload, "\"monitor_slug\":\"nightly\"") != null);
+    try testing.expect(std.mem.indexOf(u8, payload, "\"status\":\"ok\"") != null);
+    try testing.expect(std.mem.indexOf(u8, payload, "\"environment\":\"production\"") != null);
+}
+
+// ─── 8. CJM End-to-End Flows (Client + Transport + Worker) ─────────────────
+
+test "CJM e2e: event with scope and attachment reaches relay" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .release = "checkout@1.2.3",
+        .environment = "staging",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.setUser(.{
+        .id = "user-42",
+        .email = "buyer@example.com",
+    });
+    client.setTag("cjm", "checkout");
+
+    var attachment = try sentry.Attachment.initOwned(
+        testing.allocator,
+        "cart.txt",
+        "sku=42",
+        "text/plain",
+        null,
+    );
+    defer attachment.deinit(testing.allocator);
+    client.addAttachment(attachment);
+
+    client.captureMessage("checkout failed", .err);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"event\""));
+    try testing.expect(relay.containsInAny("\"checkout failed\""));
+    try testing.expect(relay.containsInAny("\"release\":\"checkout@1.2.3\""));
+    try testing.expect(relay.containsInAny("\"environment\":\"staging\""));
+    try testing.expect(relay.containsInAny("\"user\":{\"id\":\"user-42\""));
+    try testing.expect(relay.containsInAny("\"tags\":{\"cjm\":\"checkout\""));
+    try testing.expect(relay.containsInAny("\"type\":\"attachment\""));
+    try testing.expect(relay.containsInAny("\"filename\":\"cart.txt\""));
+    try testing.expect(relay.containsInAny("sku=42"));
+}
+
+test "CJM e2e: transaction is sent when traces sample rate is enabled" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .release = "checkout@1.2.3",
+        .environment = "staging",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "POST /checkout",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const child = try txn.startChild(.{
+        .op = "db.query",
+        .description = "INSERT INTO orders",
+    });
+    child.finish();
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"transaction\":\"POST /checkout\""));
+    try testing.expect(relay.containsInAny("\"op\":\"http.server\""));
+    try testing.expect(relay.containsInAny("\"op\":\"db.query\""));
+    try testing.expect(relay.containsInAny("\"release\":\"checkout@1.2.3\""));
+    try testing.expect(relay.containsInAny("\"environment\":\"staging\""));
+}
+
+test "CJM e2e: session emits errored and exited updates" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .release = "checkout@1.2.3",
+        .environment = "production",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.startSession();
+    client.captureException("CheckoutError", "payment declined");
+    client.endSession(.exited);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(3, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"session\""));
+    try testing.expect(relay.containsInAny("\"status\":\"errored\""));
+    try testing.expect(relay.containsInAny("\"errors\":1"));
+    try testing.expect(relay.containsInAny("\"status\":\"exited\""));
+    try testing.expect(relay.containsInAny("\"type\":\"event\""));
+    try testing.expect(relay.containsInAny("\"payment declined\""));
+}
+
+test "CJM e2e: monitor check-in inherits client environment" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .environment = "production",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var check_in = sentry.MonitorCheckIn.init("checkout-cron", .in_progress);
+    client.captureCheckIn(&check_in);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"check_in\""));
+    try testing.expect(relay.containsInAny("\"monitor_slug\":\"checkout-cron\""));
+    try testing.expect(relay.containsInAny("\"status\":\"in_progress\""));
+    try testing.expect(relay.containsInAny("\"environment\":\"production\""));
+}
+
+test "CJM e2e: rate limits drop subsequent error envelopes" {
+    const response_headers = [_]std.http.Header{
+        .{ .name = "X-Sentry-Rate-Limits", .value = "60:error:organization" },
+    };
+    var relay = try CaptureRelay.init(testing.allocator, &response_headers);
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureMessage("first should pass", .warning);
+    client.captureMessage("second should drop", .warning);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+    try testing.expectEqual(@as(usize, 1), relay.requestCount());
+    try testing.expect(relay.containsInAny("first should pass"));
+    try testing.expect(!relay.containsInAny("second should drop"));
+}
+
+test "CJM e2e: error rate limits also block events with attachments" {
+    const response_headers = [_]std.http.Header{
+        .{ .name = "X-Sentry-Rate-Limits", .value = "60:error:organization" },
+    };
+    var relay = try CaptureRelay.init(testing.allocator, &response_headers);
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var attachment = try sentry.Attachment.initOwned(
+        testing.allocator,
+        "debug.txt",
+        "attachment-payload",
+        "text/plain",
+        null,
+    );
+    defer attachment.deinit(testing.allocator);
+    client.addAttachment(attachment);
+
+    client.captureMessage("first with attachment", .warning);
+    client.captureMessage("second with attachment", .warning);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+    try testing.expectEqual(@as(usize, 1), relay.requestCount());
+    try testing.expect(relay.containsInAny("first with attachment"));
+    try testing.expect(!relay.containsInAny("second with attachment"));
+}
+
+// ─── 9. Timestamp Formatting ────────────────────────────────────────────────
 
 test "Timestamp: now() is reasonable" {
     const t = sentry.timestamp.now();

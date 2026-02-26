@@ -118,7 +118,7 @@ pub const Transaction = struct {
     start_timestamp: f64,
     timestamp: ?f64 = null,
     status: ?SpanStatus = null,
-    spans: std.ArrayList(Span) = .{},
+    spans: std.ArrayList(*Span) = .{},
     allocator: Allocator,
     sampled: bool = true,
     sample_rate: f64 = 1.0,
@@ -147,12 +147,17 @@ pub const Transaction = struct {
 
     /// Free resources.
     pub fn deinit(self: *Transaction) void {
+        for (self.spans.items) |span| {
+            self.allocator.destroy(span);
+        }
         self.spans.deinit(self.allocator);
     }
 
     /// Create a child span with the same trace_id and this transaction's span_id as parent.
     pub fn startChild(self: *Transaction, opts: ChildSpanOpts) !*Span {
-        const span = try self.spans.addOne(self.allocator);
+        const span = try self.allocator.create(Span);
+        errdefer self.allocator.destroy(span);
+
         span.* = Span{
             .trace_id = self.trace_id,
             .span_id = generateSpanId(),
@@ -161,6 +166,8 @@ pub const Transaction = struct {
             .description = opts.description,
             .start_timestamp = ts.now(),
         };
+
+        try self.spans.append(self.allocator, span);
         return span;
     }
 
@@ -207,6 +214,8 @@ pub const Transaction = struct {
             try w.writeAll(",\"op\":");
             try json.Stringify.value(op, .{}, w);
         }
+        try w.writeAll(",\"sampled\":");
+        try w.writeAll(if (self.sampled) "true" else "false");
         if (self.status) |status| {
             try w.writeAll(",\"status\":\"");
             try w.writeAll(status.toString());
@@ -228,7 +237,7 @@ pub const Transaction = struct {
         try w.writeAll(",\"spans\":[");
         for (self.spans.items, 0..) |span, i| {
             if (i > 0) try w.writeByte(',');
-            try writeSpanJson(w, &span);
+            try writeSpanJson(w, span);
         }
         try w.writeByte(']');
 
@@ -328,6 +337,28 @@ test "Transaction.startChild creates span with matching trace_id and parent_span
     try testing.expect(!std.mem.eql(u8, &txn.span_id, &child.span_id));
 }
 
+test "Transaction.startChild keeps span pointers stable across growth" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /stable",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const first = try txn.startChild(.{ .op = "first" });
+    const first_addr = @intFromPtr(first);
+
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        _ = try txn.startChild(.{ .op = "next" });
+    }
+
+    try testing.expectEqual(first_addr, @intFromPtr(first));
+    try testing.expectEqual(first_addr, @intFromPtr(txn.spans.items[0]));
+
+    first.finish();
+    try testing.expect(first.timestamp != null);
+}
+
 test "Span.finish sets timestamp and status" {
     var span = Span{
         .trace_id = Uuid.v4().toHex(),
@@ -390,6 +421,8 @@ test "Transaction.toJson produces valid JSON with transaction name, op, spans ar
     try testing.expect(std.mem.indexOf(u8, json_str, "\"spans\":[") != null);
     // Verify child span op
     try testing.expect(std.mem.indexOf(u8, json_str, "\"op\":\"db.query\"") != null);
+    // Verify sampled field in trace context
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"sampled\":true") != null);
     // Verify platform
     try testing.expect(std.mem.indexOf(u8, json_str, "\"platform\":\"other\"") != null);
     // Verify release

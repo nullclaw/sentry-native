@@ -6,6 +6,7 @@ const Writer = std.io.Writer;
 
 const Dsn = @import("dsn.zig").Dsn;
 const Event = @import("event.zig").Event;
+const Attachment = @import("attachment.zig").Attachment;
 const ts = @import("timestamp.zig");
 
 pub const SDK_NAME = "sentry-zig";
@@ -18,6 +19,17 @@ pub const SDK_VERSION = "0.1.0";
 ///   {item_header_json}\n
 ///   {item_payload}
 pub fn serializeEventEnvelope(allocator: Allocator, event: Event, dsn: Dsn, writer: *Writer) !void {
+    return serializeEventEnvelopeWithAttachments(allocator, event, dsn, &.{}, writer);
+}
+
+/// Serialize an event envelope and include attachment items.
+pub fn serializeEventEnvelopeWithAttachments(
+    allocator: Allocator,
+    event: Event,
+    dsn: Dsn,
+    attachments: []const Attachment,
+    writer: *Writer,
+) !void {
     // First, serialize the event payload to get its byte length.
     const payload = try json.Stringify.valueAlloc(
         allocator,
@@ -47,8 +59,30 @@ pub fn serializeEventEnvelope(allocator: Allocator, event: Event, dsn: Dsn, writ
     try writer.writeByte('}');
     try writer.writeByte('\n');
 
-    // Payload
+    // Event payload
     try writer.writeAll(payload);
+
+    for (attachments) |attachment| {
+        try writer.writeByte('\n');
+        try writer.writeAll("{\"type\":\"attachment\",\"length\":");
+        try writer.print("{d}", .{attachment.data.len});
+        try writer.writeAll(",\"filename\":");
+        try json.Stringify.value(attachment.filename, .{}, writer);
+
+        if (attachment.content_type) |content_type| {
+            try writer.writeAll(",\"content_type\":");
+            try json.Stringify.value(content_type, .{}, writer);
+        }
+
+        if (attachment.attachment_type) |attachment_type| {
+            try writer.writeAll(",\"attachment_type\":");
+            try json.Stringify.value(attachment_type, .{}, writer);
+        }
+
+        try writer.writeByte('}');
+        try writer.writeByte('\n');
+        try writer.writeAll(attachment.data);
+    }
 }
 
 /// Serialize a session envelope.
@@ -76,6 +110,31 @@ pub fn serializeSessionEnvelope(dsn: Dsn, session_json: []const u8, writer: *Wri
 
     // Payload
     try writer.writeAll(session_json);
+}
+
+/// Serialize a monitor check-in envelope.
+pub fn serializeCheckInEnvelope(dsn: Dsn, check_in_json: []const u8, writer: *Writer) !void {
+    // Envelope header line (no event_id for check-ins)
+    try writer.writeAll("{\"dsn\":\"");
+    try dsn.writeDsn(writer);
+    try writer.writeAll("\",\"sent_at\":\"");
+    const rfc3339 = ts.nowRfc3339();
+    try writer.writeAll(&rfc3339);
+    try writer.writeAll("\",\"sdk\":{\"name\":\"");
+    try writer.writeAll(SDK_NAME);
+    try writer.writeAll("\",\"version\":\"");
+    try writer.writeAll(SDK_VERSION);
+    try writer.writeAll("\"}}");
+    try writer.writeByte('\n');
+
+    // Item header line
+    try writer.writeAll("{\"type\":\"check_in\",\"length\":");
+    try writer.print("{d}", .{check_in_json.len});
+    try writer.writeByte('}');
+    try writer.writeByte('\n');
+
+    // Payload
+    try writer.writeAll(check_in_json);
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -179,4 +238,53 @@ test "serializeSessionEnvelope produces valid format" {
 
     // Payload should match
     try testing.expectEqualStrings(session_json, line3);
+}
+
+test "serializeEventEnvelopeWithAttachments includes attachment item headers and payloads" {
+    const allocator = testing.allocator;
+    const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
+    const event = Event.initMessage("attachment test", .info);
+
+    var attachment = try Attachment.initOwned(
+        allocator,
+        "debug.txt",
+        "debug-body",
+        "text/plain",
+        "event.attachment",
+    );
+    defer attachment.deinit(allocator);
+
+    var aw: Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
+    try serializeEventEnvelopeWithAttachments(allocator, event, dsn, &.{attachment}, &aw.writer);
+    const output = aw.written();
+
+    try testing.expect(std.mem.indexOf(u8, output, "\"type\":\"event\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"type\":\"attachment\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"filename\":\"debug.txt\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"content_type\":\"text/plain\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "\"attachment_type\":\"event.attachment\"") != null);
+    try testing.expect(std.mem.indexOf(u8, output, "debug-body") != null);
+}
+
+test "serializeCheckInEnvelope produces valid format" {
+    const dsn = try Dsn.parse("https://key@sentry.example.com/42");
+    const check_in_json =
+        "{\"check_in_id\":\"0123456789abcdef0123456789abcdef\",\"monitor_slug\":\"nightly\",\"status\":\"ok\"}";
+
+    var aw: Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try serializeCheckInEnvelope(dsn, check_in_json, &aw.writer);
+    const output = aw.written();
+
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    const line1 = lines.next().?;
+    const line2 = lines.next().?;
+    const line3 = lines.rest();
+
+    try testing.expect(std.mem.indexOf(u8, line1, "\"dsn\"") != null);
+    try testing.expect(std.mem.indexOf(u8, line2, "\"type\":\"check_in\"") != null);
+    try testing.expectEqualStrings(check_in_json, line3);
 }
