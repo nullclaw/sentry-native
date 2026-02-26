@@ -857,6 +857,41 @@ test "CJM e2e: default_integrations false omits runtime and os contexts" {
     try testing.expect(!relay.containsInAny("\"os\":"));
 }
 
+test "CJM e2e: in_app_include marks matching exception frames" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const include_patterns = [_][]const u8{"my.app"};
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .in_app_include = &include_patterns,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]sentry.Frame{.{
+        .module = "my.app.checkout",
+        .function = "submit",
+    }};
+    const values = [_]sentry.ExceptionValue{.{
+        .type = "CheckoutError",
+        .value = "failure",
+        .stacktrace = sentry.Stacktrace{ .frames = &frames },
+    }};
+    var event = sentry.Event.initException(&values);
+    _ = client.captureEventId(&event);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"event\""));
+    try testing.expect(relay.containsInAny("\"in_app\":true"));
+}
+
 // ─── 9. Timestamp Formatting ────────────────────────────────────────────────
 
 test "Timestamp: now() is reasonable" {

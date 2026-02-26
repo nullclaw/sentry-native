@@ -268,6 +268,10 @@ For regular event messages, the SDK automatically adds default contexts
 is missing in the input event.
 
 Set `default_integrations=false` to disable automatic `runtime`/`os` context enrichment.
+
+Set `in_app_include` / `in_app_exclude` to classify exception stack frames.
+Matching `in_app_include` patterns set `frame.in_app=true`, matching
+`in_app_exclude` patterns set `frame.in_app=false`.
 For transaction envelopes, the SDK adds a dynamic trace header
 (`trace_id/public_key/sample_rate/sampled`).
 

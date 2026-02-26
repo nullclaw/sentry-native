@@ -206,6 +206,7 @@ All options are provided via `sentry.Options` in `sentry.init`.
 
 When `default_integrations = false`, automatic runtime/os context enrichment is disabled
 (trace context bootstrap remains enabled).
+`in_app_include`/`in_app_exclude` are applied to exception stack frames.
 | `cache_dir` | `[]const u8` | `"/tmp/sentry-zig"` | Crash marker directory |
 | `user_agent` | `[]const u8` | `"sentry-zig/0.1.0"` | Transport User-Agent |
 | `install_signal_handlers` | `bool` | `true` | POSIX signal handler install |

@@ -12,6 +12,8 @@ const Event = event_mod.Event;
 const Level = event_mod.Level;
 const User = event_mod.User;
 const Breadcrumb = event_mod.Breadcrumb;
+const Frame = event_mod.Frame;
+const Stacktrace = event_mod.Stacktrace;
 const ExceptionValue = event_mod.ExceptionValue;
 const ExceptionInterface = event_mod.ExceptionInterface;
 const Message = event_mod.Message;
@@ -36,6 +38,21 @@ const LogEntry = log_mod.LogEntry;
 const LogLevel = log_mod.LogLevel;
 const propagation = @import("propagation.zig");
 const DynamicSamplingContext = propagation.DynamicSamplingContext;
+
+const ExceptionFrameOwnership = struct {
+    allocator: Allocator,
+    values: []ExceptionValue,
+    frames_per_value: []?[]Frame,
+
+    fn deinit(self: *ExceptionFrameOwnership) void {
+        for (self.frames_per_value) |maybe_frames| {
+            if (maybe_frames) |frames| self.allocator.free(frames);
+        }
+        self.allocator.free(self.frames_per_value);
+        self.allocator.free(self.values);
+        self.* = undefined;
+    }
+};
 
 pub const SessionMode = enum {
     application,
@@ -297,6 +314,23 @@ pub const Client = struct {
         defer scope_mod.cleanupAppliedToEvent(self.allocator, &prepared_event_value, applied);
 
         const prepared_event: *Event = &prepared_event_value;
+
+        var owned_exception_frames: ?ExceptionFrameOwnership = null;
+        defer if (owned_exception_frames) |*ownership| {
+            ownership.deinit();
+            prepared_event.exception = null;
+        };
+
+        if (self.options.in_app_include != null or self.options.in_app_exclude != null) {
+            if (applyInAppFrameHints(
+                self.allocator,
+                prepared_event,
+                self.options.in_app_include,
+                self.options.in_app_exclude,
+            ) catch null) |ownership| {
+                owned_exception_frames = ownership;
+            }
+        }
 
         var owned_trace_contexts: ?json.Value = null;
         defer if (owned_trace_contexts) |*contexts| {
@@ -714,6 +748,99 @@ pub const Client = struct {
     }
 
     // ─── Internal Helpers ────────────────────────────────────────────────
+
+    fn applyInAppFrameHints(
+        allocator: Allocator,
+        event: *Event,
+        in_app_include: ?[]const []const u8,
+        in_app_exclude: ?[]const []const u8,
+    ) !?ExceptionFrameOwnership {
+        const exception = event.exception orelse return null;
+        if (exception.values.len == 0) return null;
+
+        const values_copy = try allocator.alloc(ExceptionValue, exception.values.len);
+        errdefer allocator.free(values_copy);
+        @memcpy(values_copy, exception.values);
+
+        const frames_per_value = try allocator.alloc(?[]Frame, exception.values.len);
+        errdefer {
+            for (frames_per_value) |maybe_frames| {
+                if (maybe_frames) |frames| allocator.free(frames);
+            }
+            allocator.free(frames_per_value);
+        }
+        @memset(frames_per_value, null);
+
+        var any_modified = false;
+        var i: usize = 0;
+        while (i < exception.values.len) : (i += 1) {
+            const value = exception.values[i];
+            if (value.stacktrace) |stacktrace| {
+                const frames_copy = try allocator.alloc(Frame, stacktrace.frames.len);
+                @memcpy(frames_copy, stacktrace.frames);
+
+                for (frames_copy) |*frame| {
+                    if (frame.in_app == null) {
+                        if (inferInApp(frame.*, in_app_include, in_app_exclude)) |in_app| {
+                            frame.in_app = in_app;
+                            any_modified = true;
+                        }
+                    }
+                }
+
+                values_copy[i].stacktrace = .{ .frames = frames_copy };
+                frames_per_value[i] = frames_copy;
+            }
+        }
+
+        if (!any_modified) {
+            for (frames_per_value) |maybe_frames| {
+                if (maybe_frames) |frames| allocator.free(frames);
+            }
+            allocator.free(frames_per_value);
+            allocator.free(values_copy);
+            return null;
+        }
+
+        event.exception = .{ .values = values_copy };
+        return ExceptionFrameOwnership{
+            .allocator = allocator,
+            .values = values_copy,
+            .frames_per_value = frames_per_value,
+        };
+    }
+
+    fn inferInApp(
+        frame: Frame,
+        in_app_include: ?[]const []const u8,
+        in_app_exclude: ?[]const []const u8,
+    ) ?bool {
+        if (in_app_include) |include_patterns| {
+            if (matchFramePatterns(frame, include_patterns)) return true;
+        }
+        if (in_app_exclude) |exclude_patterns| {
+            if (matchFramePatterns(frame, exclude_patterns)) return false;
+        }
+        return null;
+    }
+
+    fn matchFramePatterns(frame: Frame, patterns: []const []const u8) bool {
+        for (patterns) |pattern| {
+            if (pattern.len == 0) continue;
+            if (frameFieldMatches(frame.filename, pattern)) return true;
+            if (frameFieldMatches(frame.function, pattern)) return true;
+            if (frameFieldMatches(frame.module, pattern)) return true;
+            if (frameFieldMatches(frame.abs_path, pattern)) return true;
+        }
+        return false;
+    }
+
+    fn frameFieldMatches(field: ?[]const u8, pattern: []const u8) bool {
+        if (field) |value| {
+            return std.mem.indexOf(u8, value, pattern) != null;
+        }
+        return false;
+    }
 
     fn putOwnedJsonEntry(
         allocator: Allocator,
@@ -1159,6 +1286,7 @@ var before_send_saw_trace_context: bool = false;
 var before_send_saw_runtime_context: bool = false;
 var before_send_saw_os_context: bool = false;
 var before_send_saw_threads: bool = false;
+var before_send_first_frame_in_app: ?bool = null;
 
 fn inspectTraceContextBeforeSend(event: *Event) ?*Event {
     before_send_saw_trace_context = hasTraceContext(event);
@@ -1169,6 +1297,20 @@ fn inspectTraceContextBeforeSend(event: *Event) ?*Event {
 
 fn inspectThreadsBeforeSend(event: *Event) ?*Event {
     before_send_saw_threads = hasThreadStacktrace(event);
+    return event;
+}
+
+fn inspectInAppBeforeSend(event: *Event) ?*Event {
+    before_send_first_frame_in_app = null;
+    if (event.exception) |exception| {
+        if (exception.values.len > 0) {
+            if (exception.values[0].stacktrace) |stacktrace| {
+                if (stacktrace.frames.len > 0) {
+                    before_send_first_frame_in_app = stacktrace.frames[0].in_app;
+                }
+            }
+        }
+    }
     return event;
 }
 
@@ -1234,6 +1376,60 @@ test "Client default_integrations false injects trace context without runtime or
     try testing.expect(before_send_saw_trace_context);
     try testing.expect(!before_send_saw_runtime_context);
     try testing.expect(!before_send_saw_os_context);
+}
+
+test "Client in_app_include marks matching exception frames as in_app=true" {
+    before_send_first_frame_in_app = null;
+
+    const include_patterns = [_][]const u8{"my.app"};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .in_app_include = &include_patterns,
+        .before_send = inspectInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{.{
+        .module = "my.app.checkout",
+        .function = "process_order",
+    }};
+    const values = [_]ExceptionValue{.{
+        .type = "CheckoutError",
+        .value = "declined",
+        .stacktrace = Stacktrace{ .frames = &frames },
+    }};
+    var event = Event.initException(&values);
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, true), before_send_first_frame_in_app);
+}
+
+test "Client in_app_exclude marks matching exception frames as in_app=false" {
+    before_send_first_frame_in_app = null;
+
+    const exclude_patterns = [_][]const u8{"vendor.lib"};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .in_app_exclude = &exclude_patterns,
+        .before_send = inspectInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{.{
+        .module = "vendor.lib.payment",
+        .function = "execute",
+    }};
+    const values = [_]ExceptionValue{.{
+        .type = "VendorError",
+        .value = "timeout",
+        .stacktrace = Stacktrace{ .frames = &frames },
+    }};
+    var event = Event.initException(&values);
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, false), before_send_first_frame_in_app);
 }
 
 test "Client attach_stacktrace adds synthetic thread stacktrace data" {
