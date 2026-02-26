@@ -3,77 +3,14 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 const Dsn = @import("dsn.zig").Dsn;
+const ratelimit = @import("ratelimit.zig");
+const RateLimitUpdate = ratelimit.Update;
 
 pub const SendResult = struct {
     status_code: u16,
     retry_after: ?u64 = null, // seconds to wait before retry
+    rate_limits: RateLimitUpdate = .{},
 };
-
-fn parseRetryAfterHeader(header_value: []const u8) ?u64 {
-    const trimmed = std.mem.trim(u8, header_value, " \t");
-    if (trimmed.len == 0) return null;
-
-    if (std.fmt.parseInt(u64, trimmed, 10)) |seconds| {
-        return seconds;
-    } else |_| {}
-
-    if (std.fmt.parseFloat(f64, trimmed)) |seconds_float| {
-        if (!std.math.isFinite(seconds_float) or seconds_float < 0) return null;
-        const max_u64_as_f64 = @as(f64, @floatFromInt(std.math.maxInt(u64)));
-        if (seconds_float > max_u64_as_f64) return null;
-        return @intFromFloat(std.math.ceil(seconds_float));
-    } else |_| {}
-
-    return null;
-}
-
-fn hasSupportedRateLimitCategory(categories_field: []const u8) bool {
-    const categories = std.mem.trim(u8, categories_field, " \t");
-    if (categories.len == 0) {
-        // Empty categories means a global rate limit.
-        return true;
-    }
-
-    var category_it = std.mem.splitScalar(u8, categories, ';');
-    while (category_it.next()) |category_raw| {
-        const category = std.mem.trim(u8, category_raw, " \t");
-        if (category.len == 0) continue;
-
-        if (std.ascii.eqlIgnoreCase(category, "error") or
-            std.ascii.eqlIgnoreCase(category, "session") or
-            std.ascii.eqlIgnoreCase(category, "transaction") or
-            std.ascii.eqlIgnoreCase(category, "attachment") or
-            std.ascii.eqlIgnoreCase(category, "log_item"))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-fn parseSentryRateLimitsHeader(header_value: []const u8) ?u64 {
-    var max_retry_after: ?u64 = null;
-    var groups = std.mem.splitScalar(u8, header_value, ',');
-    while (groups.next()) |group| {
-        const trimmed_group = std.mem.trim(u8, group, " \t");
-        if (trimmed_group.len == 0) continue;
-
-        var parts = std.mem.splitScalar(u8, trimmed_group, ':');
-        const seconds_str = parts.next() orelse continue;
-        const categories_str = parts.next() orelse continue;
-        if (!hasSupportedRateLimitCategory(categories_str)) continue;
-
-        const seconds = parseRetryAfterHeader(seconds_str) orelse continue;
-
-        if (max_retry_after) |current| {
-            if (seconds > current) max_retry_after = seconds;
-        } else {
-            max_retry_after = seconds;
-        }
-    }
-
-    return max_retry_after;
-}
 
 /// HTTP Transport for sending serialized envelopes to Sentry via HTTPS POST.
 pub const Transport = struct {
@@ -129,25 +66,15 @@ pub const Transport = struct {
         var response = try req.receiveHead(&.{});
         const status_code: u16 = @intFromEnum(response.head.status);
 
-        var retry_after: ?u64 = null;
+        var rate_limits: RateLimitUpdate = .{};
         var header_it = response.head.iterateHeaders();
         while (header_it.next()) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
-                if (parseRetryAfterHeader(header.value)) |seconds| {
-                    if (retry_after) |current| {
-                        if (seconds > current) retry_after = seconds;
-                    } else {
-                        retry_after = seconds;
-                    }
+                if (ratelimit.parseRetryAfterHeader(header.value)) |seconds| {
+                    rate_limits.setMax(.any, seconds);
                 }
             } else if (std.ascii.eqlIgnoreCase(header.name, "x-sentry-rate-limits")) {
-                if (parseSentryRateLimitsHeader(header.value)) |seconds| {
-                    if (retry_after) |current| {
-                        if (seconds > current) retry_after = seconds;
-                    } else {
-                        retry_after = seconds;
-                    }
-                }
+                rate_limits.merge(ratelimit.parseSentryRateLimitsHeader(header.value));
             }
         }
 
@@ -157,14 +84,15 @@ pub const Transport = struct {
             error.ReadFailed => return response.bodyErr().?,
         };
 
-        if (retry_after == null and status_code == 429) {
+        if (rate_limits.isEmpty() and status_code == 429) {
             // Default to 60s retry-after for rate-limited responses
-            retry_after = 60;
+            rate_limits.setMax(.any, 60);
         }
 
         return SendResult{
             .status_code = status_code,
-            .retry_after = retry_after,
+            .retry_after = rate_limits.any,
+            .rate_limits = rate_limits,
         };
     }
 };
@@ -174,6 +102,7 @@ pub const MockTransport = struct {
     sent: std.ArrayListUnmanaged([]u8) = .{},
     allocator: Allocator,
     response_status: u16 = 200,
+    response_rate_limits: RateLimitUpdate = .{},
 
     pub fn init(allocator: Allocator) MockTransport {
         return MockTransport{
@@ -194,14 +123,15 @@ pub const MockTransport = struct {
         const copy = try self.allocator.dupe(u8, envelope_data);
         try self.sent.append(self.allocator, copy);
 
-        var retry_after: ?u64 = null;
-        if (self.response_status == 429) {
-            retry_after = 60;
+        var rate_limits = self.response_rate_limits;
+        if (rate_limits.isEmpty() and self.response_status == 429) {
+            rate_limits.setMax(.any, 60);
         }
 
         return SendResult{
             .status_code = self.response_status,
-            .retry_after = retry_after,
+            .retry_after = rate_limits.any,
+            .rate_limits = rate_limits,
         };
     }
 
@@ -270,25 +200,12 @@ test "Transport stores custom user agent" {
     try testing.expectEqualStrings("my-sdk/9.9.9", transport.user_agent);
 }
 
-test "parseRetryAfterHeader parses integer and float values" {
-    try testing.expectEqual(@as(?u64, 60), parseRetryAfterHeader("60"));
-    try testing.expectEqual(@as(?u64, 61), parseRetryAfterHeader("60.1"));
-    try testing.expectEqual(@as(?u64, 0), parseRetryAfterHeader("0"));
-}
+test "MockTransport exposes configured rate limits" {
+    var mock = MockTransport.init(testing.allocator);
+    defer mock.deinit();
+    mock.response_rate_limits.setMax(.transaction, 45);
 
-test "parseRetryAfterHeader rejects invalid values" {
-    try testing.expectEqual(@as(?u64, null), parseRetryAfterHeader(""));
-    try testing.expectEqual(@as(?u64, null), parseRetryAfterHeader("abc"));
-    try testing.expectEqual(@as(?u64, null), parseRetryAfterHeader("-1"));
-    try testing.expectEqual(@as(?u64, null), parseRetryAfterHeader("1e400"));
-}
-
-test "parseSentryRateLimitsHeader returns max group duration" {
-    const header = "120:error:project:reason, 60:session:foo, 240::organization";
-    try testing.expectEqual(@as(?u64, 240), parseSentryRateLimitsHeader(header));
-}
-
-test "parseSentryRateLimitsHeader ignores unsupported categories" {
-    try testing.expectEqual(@as(?u64, null), parseSentryRateLimitsHeader("120:security:org"));
-    try testing.expectEqual(@as(?u64, 60), parseSentryRateLimitsHeader("120:security:org, 60:error:org"));
+    const result = try mock.send("data");
+    try testing.expectEqual(@as(?u64, 45), result.rate_limits.transaction);
+    try testing.expectEqual(@as(?u64, null), result.retry_after);
 }

@@ -108,7 +108,8 @@ pub fn main() !void {
 - **Background Worker** -- Events are serialized to the Sentry envelope format
   and sent asynchronously via a background thread with a bounded queue.
 - **HTTP Transport** -- Envelopes are delivered via `std.http.Client` POST to
-  the Sentry envelope endpoint. Rate-limit (429) responses are handled.
+  the Sentry envelope endpoint. `Retry-After` and `X-Sentry-Rate-Limits`
+  headers are parsed, with category-aware backoff in the worker.
 - **Sampling** -- Configurable `sample_rate` for events and `traces_sample_rate`
   for transactions.
 - **Before-Send Hook** -- Optional `before_send` callback to inspect or drop

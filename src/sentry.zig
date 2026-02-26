@@ -28,6 +28,9 @@ pub const envelope = @import("envelope.zig");
 pub const Uuid = @import("uuid.zig").Uuid;
 pub const timestamp = @import("timestamp.zig");
 pub const Worker = @import("worker.zig").Worker;
+pub const RateLimitCategory = @import("ratelimit.zig").Category;
+pub const RateLimitUpdate = @import("ratelimit.zig").Update;
+pub const RateLimitState = @import("ratelimit.zig").State;
 pub const signal_handler = @import("signal_handler.zig");
 
 /// Initialize a new Sentry client with the given options.

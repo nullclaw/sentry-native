@@ -202,7 +202,7 @@ pub const Client = struct {
         const data = self.serializeEventEnvelope(prepared_event) catch return;
 
         // Submit to worker queue (worker takes ownership of data)
-        self.worker.submit(data) catch {
+        self.worker.submit(data, .@"error") catch {
             self.allocator.free(data);
         };
     }
@@ -301,7 +301,7 @@ pub const Client = struct {
         // Create transaction envelope
         const data = self.serializeTransactionEnvelope(txn, txn_json) catch return;
 
-        self.worker.submit(data) catch {
+        self.worker.submit(data, .transaction) catch {
             self.allocator.free(data);
         };
     }
@@ -352,7 +352,7 @@ pub const Client = struct {
         if (ctx) |ptr| {
             const client: *Client = @ptrCast(@alignCast(ptr));
             const send_result = client.transport.send(data) catch return .{};
-            return .{ .retry_after_secs = send_result.retry_after };
+            return .{ .rate_limits = send_result.rate_limits };
         }
         return .{};
     }
@@ -438,7 +438,7 @@ pub const Client = struct {
             return false;
         };
 
-        self.worker.submit(data) catch {
+        self.worker.submit(data, .session) catch {
             self.allocator.free(data);
             return false;
         };
