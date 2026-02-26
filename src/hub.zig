@@ -178,6 +178,16 @@ pub const Hub = struct {
         try self.topScope().setTransaction(transaction);
     }
 
+    /// Set or clear active span context for trace propagation on the top scope.
+    pub fn setSpan(self: *Hub, source: ?TransactionOrSpan) void {
+        if (source) |value| {
+            const trace_context = value.getTraceContext();
+            self.topScope().setPropagationContext(trace_context.trace_id, trace_context.span_id);
+        } else {
+            self.topScope().resetPropagationContext();
+        }
+    }
+
     pub fn setFingerprint(self: *Hub, fingerprint: ?[]const []const u8) void {
         self.topScope().setFingerprint(fingerprint) catch {};
     }
@@ -265,11 +275,11 @@ pub const Hub = struct {
     }
 
     pub fn captureLog(self: *Hub, entry: *const LogEntry) void {
-        self.client.captureLog(entry);
+        self.client.captureLogWithScope(entry, self.topScope());
     }
 
     pub fn captureLogMessage(self: *Hub, message: []const u8, level: LogLevel) void {
-        self.client.captureLogMessage(message, level);
+        self.client.captureLogMessageWithScope(message, level, self.topScope());
     }
 
     // ─── Client Delegation ───────────────────────────────────────────────
@@ -760,6 +770,42 @@ test "Hub startTransactionWithTimestamp applies explicit start timestamp" {
     defer txn.deinit();
 
     try testing.expectEqual(explicit_start, txn.start_timestamp);
+}
+
+test "Hub setSpan propagates trace context to captured logs" {
+    var state = HubPayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .transport = .{
+            .send_fn = hubPayloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    var txn = hub.startTransaction(.{
+        .name = "GET /hub-span-log",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    hub.setSpan(.{ .transaction = &txn });
+    hub.captureLogMessage("hub-span-log", .info);
+    _ = client.flush(1000);
+
+    const expected_trace = try std.fmt.allocPrint(testing.allocator, "\"trace_id\":\"{s}\"", .{txn.trace_id[0..]});
+    defer testing.allocator.free(expected_trace);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"type\":\"log\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, expected_trace) != null);
 }
 
 test "Hub finishTransaction applies top scope transaction metadata" {

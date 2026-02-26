@@ -227,6 +227,12 @@ pub fn popScope() bool {
     return hub.popScope();
 }
 
+pub fn setSpan(source: ?TransactionOrSpan) bool {
+    const hub = Hub.current() orelse return false;
+    hub.setSpan(source);
+    return true;
+}
+
 pub fn withScope(callback: *const fn (*Hub) void) bool {
     const hub = Hub.current() orelse return false;
     hub.withScope(callback) catch return false;
@@ -311,6 +317,7 @@ test "global wrappers are safe no-op without current hub" {
     ) == null);
     try std.testing.expect(!pushScope());
     try std.testing.expect(!popScope());
+    try std.testing.expect(!setSpan(null));
     try std.testing.expect(!configureScope(configureScopeSetInner));
     try std.testing.expect(!withIntegration(testGlobalIntegrationSetup, inspectGlobalIntegrationLookup));
     try std.testing.expect(global_integration_lookup_called);
@@ -354,6 +361,7 @@ test "global wrappers route through current hub" {
     hub.setTag("scope", "inner");
     try std.testing.expect(popScope());
     try std.testing.expect(hub.currentScope().tags.get("scope") == null);
+    try std.testing.expect(setSpan(null));
 
     try std.testing.expect(withScope(withScopeSetTag));
     try std.testing.expect(hub.currentScope().tags.get("scope") == null);

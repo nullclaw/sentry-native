@@ -9,10 +9,16 @@ const Level = event_mod.Level;
 const User = event_mod.User;
 const Breadcrumb = event_mod.Breadcrumb;
 const Attachment = @import("attachment.zig").Attachment;
+const Uuid = @import("uuid.zig").Uuid;
 const ts = @import("timestamp.zig");
 
 pub const MAX_BREADCRUMBS = 200;
 pub const EventProcessor = *const fn (*Event) bool;
+
+pub const PropagationContext = struct {
+    trace_id: [32]u8,
+    span_id: [16]u8,
+};
 
 pub const ApplyResult = struct {
     level_applied: bool = false,
@@ -194,6 +200,24 @@ pub fn deinitBreadcrumbDeep(allocator: Allocator, crumb: *Breadcrumb) void {
     crumb.data = null;
 }
 
+fn randomSpanId() [16]u8 {
+    var bytes: [8]u8 = undefined;
+    std.crypto.random.bytes(&bytes);
+
+    var out: [16]u8 = undefined;
+    _ = std.fmt.bufPrint(&out, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    }) catch unreachable;
+    return out;
+}
+
+fn generatePropagationContext() PropagationContext {
+    return .{
+        .trace_id = Uuid.v4().toHex(),
+        .span_id = randomSpanId(),
+    };
+}
+
 /// Fixed-size ring buffer for breadcrumbs.
 pub const BreadcrumbBuffer = struct {
     buffer: []Breadcrumb,
@@ -337,6 +361,7 @@ pub const Scope = struct {
     tags: std.StringHashMap([]const u8),
     extra: std.StringHashMap(json.Value),
     contexts: std.StringHashMap(json.Value),
+    propagation_context: PropagationContext,
     attachments: std.ArrayListUnmanaged(Attachment) = .{},
     event_processors: std.ArrayListUnmanaged(EventProcessor) = .{},
     breadcrumbs: BreadcrumbBuffer,
@@ -348,6 +373,7 @@ pub const Scope = struct {
             .tags = std.StringHashMap([]const u8).init(allocator),
             .extra = std.StringHashMap(json.Value).init(allocator),
             .contexts = std.StringHashMap(json.Value).init(allocator),
+            .propagation_context = generatePropagationContext(),
             .breadcrumbs = try BreadcrumbBuffer.init(allocator, max_breadcrumbs),
         };
     }
@@ -363,6 +389,7 @@ pub const Scope = struct {
             .tags = std.StringHashMap([]const u8).init(allocator),
             .extra = std.StringHashMap(json.Value).init(allocator),
             .contexts = std.StringHashMap(json.Value).init(allocator),
+            .propagation_context = self.propagation_context,
             .breadcrumbs = try BreadcrumbBuffer.init(allocator, self.breadcrumbs.capacity),
         };
         errdefer cloned.deinit();
@@ -492,6 +519,30 @@ pub const Scope = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.level = level;
+    }
+
+    /// Set the propagation trace context used when no active span is bound.
+    pub fn setPropagationContext(self: *Scope, trace_id: [32]u8, span_id: [16]u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.propagation_context = .{
+            .trace_id = trace_id,
+            .span_id = span_id,
+        };
+    }
+
+    /// Reset propagation context to a new random trace/span pair.
+    pub fn resetPropagationContext(self: *Scope) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.propagation_context = generatePropagationContext();
+    }
+
+    /// Snapshot current propagation context.
+    pub fn getPropagationContext(self: *Scope) PropagationContext {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.propagation_context;
     }
 
     /// Set transaction name override for events in this scope.
@@ -958,6 +1009,7 @@ pub const Scope = struct {
         self.clearAttachmentsOwned();
         self.event_processors.clearRetainingCapacity();
         self.breadcrumbs.clear();
+        self.propagation_context = generatePropagationContext();
     }
 
     fn clearAttachmentsOwned(self: *Scope) void {
@@ -1087,6 +1139,25 @@ test "Scope setTag and setUser" {
     try testing.expectEqualStrings("test@example.com", scope.user.?.email.?);
     try testing.expectEqualStrings("production", scope.tags.get("environment").?);
     try testing.expectEqualStrings("1.0.0", scope.tags.get("release").?);
+}
+
+test "Scope propagation context can be set and reset" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    const original = scope.getPropagationContext();
+
+    const trace_id: [32]u8 = "0123456789abcdef0123456789abcdef".*;
+    const span_id: [16]u8 = "89abcdef01234567".*;
+    scope.setPropagationContext(trace_id, span_id);
+
+    const updated = scope.getPropagationContext();
+    try testing.expectEqualSlices(u8, trace_id[0..], updated.trace_id[0..]);
+    try testing.expectEqualSlices(u8, span_id[0..], updated.span_id[0..]);
+
+    scope.resetPropagationContext();
+    const reset = scope.getPropagationContext();
+    try testing.expect(!std.mem.eql(u8, original.trace_id[0..], reset.trace_id[0..]) or !std.mem.eql(u8, original.span_id[0..], reset.span_id[0..]));
 }
 
 test "Scope applyToEvent" {

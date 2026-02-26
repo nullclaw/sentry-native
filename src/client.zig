@@ -33,7 +33,6 @@ const txn_mod = @import("transaction.zig");
 const Transaction = txn_mod.Transaction;
 const TransactionOpts = txn_mod.TransactionOpts;
 const TransactionOrSpan = txn_mod.TransactionOrSpan;
-const Uuid = @import("uuid.zig").Uuid;
 const log_mod = @import("log.zig");
 const LogEntry = log_mod.LogEntry;
 const LogLevel = log_mod.LogLevel;
@@ -268,13 +267,17 @@ pub const Client = struct {
 
     /// Capture a structured log item.
     pub fn captureLog(self: *Client, entry: *const LogEntry) void {
+        self.captureLogWithScope(entry, &self.scope);
+    }
+
+    /// Capture a structured log item using the provided scope.
+    pub fn captureLogWithScope(self: *Client, entry: *const LogEntry, source_scope: *Scope) void {
         if (!self.isEnabled()) return;
         if (!self.options.enable_logs) return;
 
         var prepared = entry.*;
         if (prepared.trace_id == null) {
-            const trace_id = Uuid.v4().toHex();
-            prepared.trace_id = trace_id;
+            prepared.trace_id = source_scope.getPropagationContext().trace_id;
         }
 
         if (self.options.before_send_log) |before_send_log| {
@@ -296,8 +299,18 @@ pub const Client = struct {
 
     /// Capture a simple structured log message.
     pub fn captureLogMessage(self: *Client, message: []const u8, level: LogLevel) void {
+        self.captureLogMessageWithScope(message, level, &self.scope);
+    }
+
+    /// Capture a simple structured log message using the provided scope.
+    pub fn captureLogMessageWithScope(
+        self: *Client,
+        message: []const u8,
+        level: LogLevel,
+        source_scope: *Scope,
+    ) void {
         var entry = LogEntry.init(message, level);
-        self.captureLog(&entry);
+        self.captureLogWithScope(&entry, source_scope);
     }
 
     /// Core method: apply defaults, sample, apply scope, run before_send,
@@ -316,6 +329,7 @@ pub const Client = struct {
         if (!self.isEnabled()) return null;
 
         var prepared_event_value = event.*;
+        const propagation_context = source_scope.getPropagationContext();
 
         // Apply defaults from options
         if (self.options.release) |release| {
@@ -361,7 +375,11 @@ pub const Client = struct {
         };
 
         if (prepared_event.contexts == null) {
-            const contexts = buildDefaultTraceContexts(self.allocator, self.options.default_integrations) catch null;
+            const contexts = buildDefaultTraceContexts(
+                self.allocator,
+                self.options.default_integrations,
+                propagation_context,
+            ) catch null;
             if (contexts) |value| {
                 prepared_event.contexts = value;
                 owned_trace_contexts = value;
@@ -371,6 +389,7 @@ pub const Client = struct {
                 self.allocator,
                 prepared_event,
                 self.options.default_integrations,
+                propagation_context,
             ) catch null) |value| {
                 prepared_event.contexts = value;
                 owned_trace_contexts = value;
@@ -484,6 +503,17 @@ pub const Client = struct {
     /// Set transaction name override on scope and surface allocation failures.
     pub fn trySetTransaction(self: *Client, transaction: ?[]const u8) !void {
         try self.scope.setTransaction(transaction);
+    }
+
+    /// Set or clear the active span context used for trace propagation.
+    /// Passing null resets propagation context to a new random trace/span pair.
+    pub fn setSpan(self: *Client, source: ?TransactionOrSpan) void {
+        if (source) |value| {
+            const trace_context = value.getTraceContext();
+            self.scope.setPropagationContext(trace_context.trace_id, trace_context.span_id);
+        } else {
+            self.scope.resetPropagationContext();
+        }
     }
 
     /// Set fingerprint override on scope.
@@ -1034,9 +1064,11 @@ pub const Client = struct {
         try putOwnedJsonEntry(allocator, object, key, .{ .bool = value });
     }
 
-    fn buildDefaultTraceContexts(allocator: Allocator, include_runtime_os: bool) !json.Value {
-        const trace_id = Uuid.v4().toHex();
-        const span_id = txn_mod.generateSpanId();
+    fn buildDefaultTraceContexts(
+        allocator: Allocator,
+        include_runtime_os: bool,
+        propagation_context: scope_mod.PropagationContext,
+    ) !json.Value {
         var runtime_version_buf: [64]u8 = undefined;
         const runtime_version = try std.fmt.bufPrint(
             &runtime_version_buf,
@@ -1056,8 +1088,8 @@ pub const Client = struct {
         };
 
         try putOwnedString(allocator, &trace_object, "type", "trace");
-        try putOwnedString(allocator, &trace_object, "trace_id", &trace_id);
-        try putOwnedString(allocator, &trace_object, "span_id", &span_id);
+        try putOwnedString(allocator, &trace_object, "trace_id", &propagation_context.trace_id);
+        try putOwnedString(allocator, &trace_object, "span_id", &propagation_context.span_id);
         try putOwnedBool(allocator, &trace_object, "sampled", false);
 
         var runtime_object: json.ObjectMap = undefined;
@@ -1176,6 +1208,7 @@ pub const Client = struct {
         allocator: Allocator,
         event: *Event,
         include_runtime_os: bool,
+        propagation_context: scope_mod.PropagationContext,
     ) !?json.Value {
         const contexts = event.contexts orelse return null;
         if (contexts != .object) return null;
@@ -1190,7 +1223,11 @@ pub const Client = struct {
         errdefer scope_mod.deinitJsonValueDeep(allocator, &merged);
         if (merged != .object) return null;
 
-        const defaults = try buildDefaultTraceContexts(allocator, include_runtime_os);
+        const defaults = try buildDefaultTraceContexts(
+            allocator,
+            include_runtime_os,
+            propagation_context,
+        );
         defer {
             var defaults_owned = defaults;
             scope_mod.deinitJsonValueDeep(allocator, &defaults_owned);
@@ -1663,6 +1700,28 @@ fn hasTraceContext(event: *const Event) bool {
     return false;
 }
 
+fn getTraceContextFromEvent(event: *const Event) ?scope_mod.PropagationContext {
+    const contexts = event.contexts orelse return null;
+    if (contexts != .object) return null;
+
+    const trace_value = contexts.object.get("trace") orelse return null;
+    if (trace_value != .object) return null;
+
+    const trace_id_value = trace_value.object.get("trace_id") orelse return null;
+    const span_id_value = trace_value.object.get("span_id") orelse return null;
+    if (trace_id_value != .string or span_id_value != .string) return null;
+    if (trace_id_value.string.len != 32 or span_id_value.string.len != 16) return null;
+
+    var trace_id: [32]u8 = undefined;
+    var span_id: [16]u8 = undefined;
+    @memcpy(trace_id[0..], trace_id_value.string);
+    @memcpy(span_id[0..], span_id_value.string);
+    return .{
+        .trace_id = trace_id,
+        .span_id = span_id,
+    };
+}
+
 fn hasNamedContext(event: *const Event, name: []const u8) bool {
     if (event.contexts) |contexts| {
         return switch (contexts) {
@@ -1700,12 +1759,49 @@ var before_send_breadcrumbs_match: bool = false;
 var combined_sequence_event_count: usize = 0;
 var combined_sequence_first_ok: bool = false;
 var combined_sequence_second_ok: bool = false;
+var before_send_trace_consistent: bool = false;
+var before_send_trace_event_count: usize = 0;
+var before_send_trace_first: ?scope_mod.PropagationContext = null;
+var expected_trace_from_span: ?scope_mod.PropagationContext = null;
+var before_send_trace_matches_span: bool = false;
+var before_send_log_matches_span_trace: bool = false;
 
 fn inspectTraceContextBeforeSend(event: *Event) ?*Event {
     before_send_saw_trace_context = hasTraceContext(event);
     before_send_saw_runtime_context = hasNamedContext(event, "runtime");
     before_send_saw_os_context = hasNamedContext(event, "os");
     return event;
+}
+
+fn inspectStableTraceContextBeforeSend(event: *Event) ?*Event {
+    const trace = getTraceContextFromEvent(event) orelse return event;
+    if (before_send_trace_event_count == 0) {
+        before_send_trace_first = trace;
+        before_send_trace_consistent = true;
+    } else if (before_send_trace_first) |first| {
+        before_send_trace_consistent =
+            before_send_trace_consistent and
+            std.mem.eql(u8, first.trace_id[0..], trace.trace_id[0..]) and
+            std.mem.eql(u8, first.span_id[0..], trace.span_id[0..]);
+    }
+    before_send_trace_event_count += 1;
+    return event;
+}
+
+fn inspectTraceContextMatchesSpanBeforeSend(event: *Event) ?*Event {
+    const expected = expected_trace_from_span orelse return event;
+    const observed = getTraceContextFromEvent(event) orelse return event;
+    before_send_trace_matches_span =
+        std.mem.eql(u8, observed.trace_id[0..], expected.trace_id[0..]) and
+        std.mem.eql(u8, observed.span_id[0..], expected.span_id[0..]);
+    return event;
+}
+
+fn inspectLogTraceMatchesSpanBeforeSend(entry: *LogEntry) ?*LogEntry {
+    const expected = expected_trace_from_span orelse return entry;
+    const observed = entry.trace_id orelse return entry;
+    before_send_log_matches_span_trace = std.mem.eql(u8, observed[0..], expected.trace_id[0..]);
+    return entry;
 }
 
 fn inspectThreadsBeforeSend(event: *Event) ?*Event {
@@ -1931,6 +2027,57 @@ test "Client captureMessage injects default trace context into event" {
     try testing.expect(before_send_saw_trace_context);
     try testing.expect(before_send_saw_runtime_context);
     try testing.expect(before_send_saw_os_context);
+}
+
+test "Client captureMessage keeps a stable propagation trace context within scope" {
+    before_send_trace_consistent = false;
+    before_send_trace_event_count = 0;
+    before_send_trace_first = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send = inspectStableTraceContextBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureMessageId("trace-ctx-1", .info) != null);
+    try testing.expect(client.captureMessageId("trace-ctx-2", .info) != null);
+
+    try testing.expectEqual(@as(usize, 2), before_send_trace_event_count);
+    try testing.expect(before_send_trace_consistent);
+}
+
+test "Client setSpan propagates trace context to captured events and logs" {
+    expected_trace_from_span = null;
+    before_send_trace_matches_span = false;
+    before_send_log_matches_span_trace = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send = inspectTraceContextMatchesSpanBeforeSend,
+        .before_send_log = inspectLogTraceMatchesSpanBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "GET /span-propagation",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    expected_trace_from_span = .{
+        .trace_id = txn.trace_id,
+        .span_id = txn.span_id,
+    };
+    client.setSpan(.{ .transaction = &txn });
+
+    try testing.expect(client.captureMessageId("event-with-span-trace", .info) != null);
+    client.captureLogMessage("log-with-span-trace", .info);
+
+    try testing.expect(before_send_trace_matches_span);
+    try testing.expect(before_send_log_matches_span_trace);
 }
 
 test "Client default_integrations false injects trace context without runtime or os" {
