@@ -29,7 +29,7 @@ const WorkQueue = struct {
     }
 
     fn pushDropOldest(self: *WorkQueue, item: WorkItem) ?WorkItem {
-        if (self.storage.len == 0) return null;
+        std.debug.assert(self.storage.len > 0);
 
         if (self.len == self.storage.len) {
             const dropped = self.storage[self.head];
@@ -66,6 +66,10 @@ pub const SendOutcome = struct {
 };
 
 pub const SendFn = *const fn ([]const u8, ?*anyopaque) SendOutcome;
+pub const SubmitResult = enum {
+    accepted,
+    dropped_shutdown,
+};
 
 /// Background worker thread that consumes work items from a thread-safe queue.
 pub const Worker = struct {
@@ -104,14 +108,15 @@ pub const Worker = struct {
 
     /// Submit a work item to the queue. The worker takes ownership of data.
     /// If the queue is full, the oldest item is dropped.
-    /// If shutdown has been requested, the data is freed immediately.
-    pub fn submit(self: *Worker, data: []u8, category: ratelimit.Category) !void {
+    /// If shutdown has been requested, the data is freed immediately and the
+    /// item is reported as dropped.
+    pub fn submit(self: *Worker, data: []u8, category: ratelimit.Category) SubmitResult {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         if (self.shutdown_flag) {
             self.allocator.free(data);
-            return;
+            return .dropped_shutdown;
         }
 
         const dropped = self.queue.pushDropOldest(.{
@@ -122,6 +127,7 @@ pub const Worker = struct {
             self.allocator.free(old.data);
         }
         self.condition.signal();
+        return .accepted;
     }
 
     /// Flush the queue, waiting up to timeout_ms for it to drain.
@@ -303,10 +309,10 @@ test "Worker submit and process via background thread" {
 
     // Submit a work item
     const data1 = try testing.allocator.dupe(u8, "item-1");
-    try worker.submit(data1, .@"error");
+    try testing.expectEqual(SubmitResult.accepted, worker.submit(data1, .@"error"));
 
     const data2 = try testing.allocator.dupe(u8, "item-2");
-    try worker.submit(data2, .@"error");
+    try testing.expectEqual(SubmitResult.accepted, worker.submit(data2, .@"error"));
 
     // Flush to wait for processing
     _ = worker.flush(1000);
@@ -325,7 +331,7 @@ test "Worker drops oldest when queue full" {
     var i: usize = 0;
     while (i < MAX_QUEUE_SIZE + 5) : (i += 1) {
         const data = try testing.allocator.dupe(u8, "item");
-        try worker.submit(data, .@"error");
+        try testing.expectEqual(SubmitResult.accepted, worker.submit(data, .@"error"));
     }
 
     try testing.expectEqual(MAX_QUEUE_SIZE, worker.queueLen());
@@ -340,7 +346,7 @@ test "Worker shutdown drains remaining items" {
     try worker.start();
 
     const data = try testing.allocator.dupe(u8, "final-item");
-    try worker.submit(data, .@"error");
+    try testing.expectEqual(SubmitResult.accepted, worker.submit(data, .@"error"));
 
     // Shutdown should process remaining items
     worker.shutdown();
@@ -366,10 +372,10 @@ test "Worker drops queued items while rate limited" {
     try worker.start();
 
     const first = try testing.allocator.dupe(u8, "first");
-    try worker.submit(first, .@"error");
+    try testing.expectEqual(SubmitResult.accepted, worker.submit(first, .@"error"));
 
     const second = try testing.allocator.dupe(u8, "second");
-    try worker.submit(second, .@"error");
+    try testing.expectEqual(SubmitResult.accepted, worker.submit(second, .@"error"));
 
     _ = worker.flush(1000);
     worker.shutdown();
@@ -386,13 +392,13 @@ test "Worker applies category-specific rate limits" {
     try worker.start();
 
     const txn1 = try testing.allocator.dupe(u8, "txn-1");
-    try worker.submit(txn1, .transaction);
+    try testing.expectEqual(SubmitResult.accepted, worker.submit(txn1, .transaction));
 
     const evt1 = try testing.allocator.dupe(u8, "evt-1");
-    try worker.submit(evt1, .@"error");
+    try testing.expectEqual(SubmitResult.accepted, worker.submit(evt1, .@"error"));
 
     const txn2 = try testing.allocator.dupe(u8, "txn-2");
-    try worker.submit(txn2, .transaction);
+    try testing.expectEqual(SubmitResult.accepted, worker.submit(txn2, .transaction));
 
     _ = worker.flush(1000);
     worker.shutdown();
@@ -400,4 +406,15 @@ test "Worker applies category-specific rate limits" {
     // Transaction limit should only drop transaction items, not errors.
     try testing.expectEqual(@as(usize, 1), ctx.sent_transaction);
     try testing.expectEqual(@as(usize, 1), ctx.sent_error);
+}
+
+test "Worker submit returns dropped_shutdown after shutdown" {
+    var worker = try Worker.init(testing.allocator, noopSendFn, null);
+    defer worker.deinit();
+
+    worker.shutdown();
+
+    const data = try testing.allocator.dupe(u8, "post-shutdown");
+    try testing.expectEqual(SubmitResult.dropped_shutdown, worker.submit(data, .@"error"));
+    try testing.expectEqual(@as(usize, 0), worker.queueLen());
 }

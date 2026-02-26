@@ -187,9 +187,7 @@ pub const Client = struct {
         defer self.allocator.free(check_in_json);
 
         const data = self.serializeCheckInEnvelope(check_in_json) catch return;
-        self.worker.submit(data, .any) catch {
-            self.allocator.free(data);
-        };
+        _ = self.worker.submit(data, .any);
     }
 
     /// Core method: apply defaults, sample, apply scope, run before_send,
@@ -262,10 +260,9 @@ pub const Client = struct {
 
         // Envelope contains an error event item (and optionally attachments),
         // so it must obey error-category rate limits.
-        self.worker.submit(data, .@"error") catch {
-            self.allocator.free(data);
+        if (self.worker.submit(data, .@"error") == .dropped_shutdown) {
             return null;
-        };
+        }
 
         self.mutex.lock();
         self.last_event_id = prepared_event.event_id;
@@ -463,9 +460,7 @@ pub const Client = struct {
         // Create transaction envelope
         const data = self.serializeTransactionEnvelope(txn_json, txn.event_id) catch return;
 
-        self.worker.submit(data, .transaction) catch {
-            self.allocator.free(data);
-        };
+        _ = self.worker.submit(data, .transaction);
     }
 
     // ─── Session Methods ─────────────────────────────────────────────────
@@ -615,10 +610,9 @@ pub const Client = struct {
             return false;
         };
 
-        self.worker.submit(data, .session) catch {
-            self.allocator.free(data);
+        if (self.worker.submit(data, .session) == .dropped_shutdown) {
             return false;
-        };
+        }
 
         session.markSent();
         return true;
