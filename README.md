@@ -172,6 +172,11 @@ const fixed_span = try timed_txn.startChildWithDetails(
     1704067200.250,
 );
 fixed_span.finishWithTimestamp(1704067200.500);
+const nested_span = try fixed_span.startChild(.{
+    .op = "db.lock",
+    .description = "Acquire order lock",
+});
+nested_span.finish();
 try timed_txn.setTag("flow", "checkout");
 try timed_txn.setExtra("attempt", .{ .integer = 2 });
 try timed_txn.setData("cache_hit", .{ .bool = true });

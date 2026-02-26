@@ -92,6 +92,7 @@ pub const TransactionOpts = struct {
 
 /// A span within a transaction.
 pub const Span = struct {
+    owner: ?*Transaction = null,
     trace_id: [32]u8,
     span_id: SpanId,
     parent_span_id: ?SpanId = null,
@@ -145,6 +146,20 @@ pub const Span = struct {
 
     pub fn setData(self: *Span, key: []const u8, value: json.Value) !void {
         try setJsonMapEntry(self.allocator, &self.data, key, value);
+    }
+
+    pub fn startChild(self: *Span, opts: ChildSpanOpts) !*Span {
+        return self.startChildWithDetails(opts, generateSpanId(), ts.now());
+    }
+
+    pub fn startChildWithDetails(
+        self: *Span,
+        opts: ChildSpanOpts,
+        span_id: SpanId,
+        start_timestamp: f64,
+    ) !*Span {
+        const owner = self.owner orelse return error.NoOwnerTransaction;
+        return owner.createChildSpan(self.span_id, opts, span_id, start_timestamp);
     }
 
     pub fn deinit(self: *Span) void {
@@ -235,6 +250,16 @@ pub const Transaction = struct {
         span_id: SpanId,
         start_timestamp: f64,
     ) !*Span {
+        return self.createChildSpan(self.span_id, opts, span_id, start_timestamp);
+    }
+
+    fn createChildSpan(
+        self: *Transaction,
+        parent_span_id: SpanId,
+        opts: ChildSpanOpts,
+        span_id: SpanId,
+        start_timestamp: f64,
+    ) !*Span {
         if (self.spans.items.len >= MAX_SPANS) {
             return error.MaxSpansExceeded;
         }
@@ -243,9 +268,10 @@ pub const Transaction = struct {
         errdefer self.allocator.destroy(span);
 
         span.* = Span{
+            .owner = self,
             .trace_id = self.trace_id,
             .span_id = span_id,
-            .parent_span_id = self.span_id,
+            .parent_span_id = parent_span_id,
             .op = opts.op,
             .description = opts.description,
             .start_timestamp = start_timestamp,
@@ -609,6 +635,41 @@ test "Transaction.startChildWithDetails applies explicit id and timestamp" {
     try testing.expect(child.parent_span_id != null);
     try testing.expectEqualSlices(u8, &txn.span_id, &child.parent_span_id.?);
     try testing.expect(child.isSampled());
+}
+
+test "Span.startChild creates nested span with parent set to source span" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /nested",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const root = try txn.startChild(.{ .op = "root" });
+    const nested = try root.startChild(.{ .op = "nested" });
+
+    try testing.expect(nested.parent_span_id != null);
+    try testing.expectEqualSlices(u8, &root.span_id, &nested.parent_span_id.?);
+}
+
+test "Span.startChildWithDetails applies explicit id and timestamp" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /nested-details",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const root = try txn.startChild(.{ .op = "root" });
+    const span_id: SpanId = "fedcba9876543210".*;
+    const start_timestamp = 1704067203.125;
+    const nested = try root.startChildWithDetails(
+        .{ .op = "nested" },
+        span_id,
+        start_timestamp,
+    );
+
+    try testing.expectEqualSlices(u8, &span_id, &nested.span_id);
+    try testing.expectEqual(start_timestamp, nested.start_timestamp);
+    try testing.expectEqualSlices(u8, &root.span_id, &nested.parent_span_id.?);
 }
 
 test "Transaction.init supports parent trace context" {

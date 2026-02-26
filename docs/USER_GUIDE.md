@@ -261,6 +261,11 @@ const span = try txn.startChild(.{
     .op = "db.query",
     .description = "INSERT INTO orders",
 });
+const nested = try span.startChild(.{
+    .op = "db.lock",
+    .description = "Acquire order lock",
+});
+nested.finish();
 span.finish();
 try txn.setTag("flow", "checkout");
 try txn.setExtra("attempt", .{ .integer = 2 });
