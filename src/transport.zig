@@ -19,10 +19,36 @@ fn parseRetryAfterHeader(header_value: []const u8) ?u64 {
 
     if (std.fmt.parseFloat(f64, trimmed)) |seconds_float| {
         if (!std.math.isFinite(seconds_float) or seconds_float < 0) return null;
+        const max_u64_as_f64 = @as(f64, @floatFromInt(std.math.maxInt(u64)));
+        if (seconds_float > max_u64_as_f64) return null;
         return @intFromFloat(std.math.ceil(seconds_float));
     } else |_| {}
 
     return null;
+}
+
+fn hasSupportedRateLimitCategory(categories_field: []const u8) bool {
+    const categories = std.mem.trim(u8, categories_field, " \t");
+    if (categories.len == 0) {
+        // Empty categories means a global rate limit.
+        return true;
+    }
+
+    var category_it = std.mem.splitScalar(u8, categories, ';');
+    while (category_it.next()) |category_raw| {
+        const category = std.mem.trim(u8, category_raw, " \t");
+        if (category.len == 0) continue;
+
+        if (std.ascii.eqlIgnoreCase(category, "error") or
+            std.ascii.eqlIgnoreCase(category, "session") or
+            std.ascii.eqlIgnoreCase(category, "transaction") or
+            std.ascii.eqlIgnoreCase(category, "attachment") or
+            std.ascii.eqlIgnoreCase(category, "log_item"))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn parseSentryRateLimitsHeader(header_value: []const u8) ?u64 {
@@ -32,8 +58,11 @@ fn parseSentryRateLimitsHeader(header_value: []const u8) ?u64 {
         const trimmed_group = std.mem.trim(u8, group, " \t");
         if (trimmed_group.len == 0) continue;
 
-        const sep_idx = std.mem.indexOfScalar(u8, trimmed_group, ':') orelse continue;
-        const seconds_str = trimmed_group[0..sep_idx];
+        var parts = std.mem.splitScalar(u8, trimmed_group, ':');
+        const seconds_str = parts.next() orelse continue;
+        const categories_str = parts.next() orelse continue;
+        if (!hasSupportedRateLimitCategory(categories_str)) continue;
+
         const seconds = parseRetryAfterHeader(seconds_str) orelse continue;
 
         if (max_retry_after) |current| {
@@ -251,9 +280,15 @@ test "parseRetryAfterHeader rejects invalid values" {
     try testing.expectEqual(@as(?u64, null), parseRetryAfterHeader(""));
     try testing.expectEqual(@as(?u64, null), parseRetryAfterHeader("abc"));
     try testing.expectEqual(@as(?u64, null), parseRetryAfterHeader("-1"));
+    try testing.expectEqual(@as(?u64, null), parseRetryAfterHeader("1e400"));
 }
 
 test "parseSentryRateLimitsHeader returns max group duration" {
     const header = "120:error:project:reason, 60:session:foo, 240::organization";
     try testing.expectEqual(@as(?u64, 240), parseSentryRateLimitsHeader(header));
+}
+
+test "parseSentryRateLimitsHeader ignores unsupported categories" {
+    try testing.expectEqual(@as(?u64, null), parseSentryRateLimitsHeader("120:security:org"));
+    try testing.expectEqual(@as(?u64, 60), parseSentryRateLimitsHeader("120:security:org, 60:error:org"));
 }
