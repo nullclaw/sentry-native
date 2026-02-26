@@ -18,6 +18,7 @@ pub const ChildSpanOpts = @import("transaction.zig").ChildSpanOpts;
 pub const Transport = @import("transport.zig").Transport;
 pub const MockTransport = @import("transport.zig").MockTransport;
 pub const Worker = @import("worker.zig").Worker;
+pub const signal_handler = @import("signal_handler.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
