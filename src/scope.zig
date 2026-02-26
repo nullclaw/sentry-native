@@ -381,6 +381,18 @@ pub const Scope = struct {
 
     /// Set the user context and surface allocation failures.
     pub fn trySetUser(self: *Scope, user: ?User) !void {
+        var replacement: ?User = null;
+        var replacement_owned = false;
+        errdefer if (replacement_owned) {
+            var owned = replacement.?;
+            deinitUserDeep(self.allocator, &owned);
+        };
+
+        if (user) |u| {
+            replacement = try cloneUser(self.allocator, u);
+            replacement_owned = true;
+        }
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -389,9 +401,8 @@ pub const Scope = struct {
             self.user = null;
         }
 
-        if (user) |u| {
-            self.user = try cloneUser(self.allocator, u);
-        }
+        self.user = replacement;
+        replacement_owned = false;
     }
 
     /// Set the event level for this scope.
@@ -403,6 +414,13 @@ pub const Scope = struct {
 
     /// Set transaction name override for events in this scope.
     pub fn setTransaction(self: *Scope, transaction: ?[]const u8) !void {
+        var replacement: ?[]const u8 = null;
+        errdefer if (replacement) |value| self.allocator.free(@constCast(value));
+
+        if (transaction) |name| {
+            replacement = try self.allocator.dupe(u8, name);
+        }
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -411,42 +429,65 @@ pub const Scope = struct {
             self.transaction = null;
         }
 
-        if (transaction) |name| {
-            self.transaction = try self.allocator.dupe(u8, name);
-        }
+        self.transaction = replacement;
+        replacement = null;
     }
 
     /// Set scope fingerprint override.
     pub fn setFingerprint(self: *Scope, fingerprint: ?[]const []const u8) !void {
+        var replacement: std.ArrayListUnmanaged([]const u8) = .{};
+        errdefer {
+            for (replacement.items) |item| {
+                self.allocator.free(@constCast(item));
+            }
+            replacement.deinit(self.allocator);
+        }
+
+        if (fingerprint) |items| {
+            try replacement.ensureTotalCapacity(self.allocator, items.len);
+            for (items) |item| {
+                try replacement.append(self.allocator, try self.allocator.dupe(u8, item));
+            }
+        }
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        self.clearFingerprintOwned();
-        if (fingerprint) |items| {
-            try self.fingerprint.ensureTotalCapacity(self.allocator, items.len);
-            for (items) |item| {
-                try self.fingerprint.append(self.allocator, try self.allocator.dupe(u8, item));
-            }
+        const old = self.fingerprint;
+        self.fingerprint = replacement;
+        replacement = .{};
+
+        for (old.items) |item| {
+            self.allocator.free(@constCast(item));
         }
+        var old_mut = old;
+        old_mut.deinit(self.allocator);
     }
 
     /// Set a tag (thread-safe).
     pub fn setTag(self: *Scope, key: []const u8, value: []const u8) !void {
+        const key_copy = try self.allocator.dupe(u8, key);
+        var value_copy: ?[]const u8 = null;
+        var committed = false;
+        errdefer if (!committed) {
+            self.allocator.free(key_copy);
+            if (value_copy) |v| self.allocator.free(@constCast(v));
+        };
+
+        value_copy = try self.allocator.dupe(u8, value);
+
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        try self.tags.ensureUnusedCapacity(1);
 
         if (self.tags.fetchRemove(key)) |kv| {
             self.allocator.free(@constCast(kv.key));
             self.allocator.free(@constCast(kv.value));
         }
 
-        const key_copy = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(key_copy);
-
-        const value_copy = try self.allocator.dupe(u8, value);
-        errdefer self.allocator.free(value_copy);
-
-        try self.tags.put(key_copy, value_copy);
+        self.tags.putAssumeCapacity(key_copy, value_copy.?);
+        committed = true;
     }
 
     /// Remove a tag.
@@ -462,8 +503,20 @@ pub const Scope = struct {
 
     /// Set an extra value (thread-safe).
     pub fn setExtra(self: *Scope, key: []const u8, value: json.Value) !void {
+        const key_copy = try self.allocator.dupe(u8, key);
+        var value_copy: ?json.Value = null;
+        var committed = false;
+        errdefer if (!committed) {
+            self.allocator.free(key_copy);
+            if (value_copy) |*v| deinitJsonValueDeep(self.allocator, v);
+        };
+
+        value_copy = try cloneJsonValue(self.allocator, value);
+
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        try self.extra.ensureUnusedCapacity(1);
 
         if (self.extra.fetchRemove(key)) |kv| {
             self.allocator.free(@constCast(kv.key));
@@ -471,13 +524,8 @@ pub const Scope = struct {
             deinitJsonValueDeep(self.allocator, &old_value);
         }
 
-        const key_copy = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(key_copy);
-
-        var value_copy = try cloneJsonValue(self.allocator, value);
-        errdefer deinitJsonValueDeep(self.allocator, &value_copy);
-
-        try self.extra.put(key_copy, value_copy);
+        self.extra.putAssumeCapacity(key_copy, value_copy.?);
+        committed = true;
     }
 
     /// Remove an extra value.
@@ -494,8 +542,20 @@ pub const Scope = struct {
 
     /// Set a context (thread-safe).
     pub fn setContext(self: *Scope, key: []const u8, value: json.Value) !void {
+        const key_copy = try self.allocator.dupe(u8, key);
+        var value_copy: ?json.Value = null;
+        var committed = false;
+        errdefer if (!committed) {
+            self.allocator.free(key_copy);
+            if (value_copy) |*v| deinitJsonValueDeep(self.allocator, v);
+        };
+
+        value_copy = try cloneJsonValue(self.allocator, value);
+
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        try self.contexts.ensureUnusedCapacity(1);
 
         if (self.contexts.fetchRemove(key)) |kv| {
             self.allocator.free(@constCast(kv.key));
@@ -503,13 +563,8 @@ pub const Scope = struct {
             deinitJsonValueDeep(self.allocator, &old_value);
         }
 
-        const key_copy = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(key_copy);
-
-        var value_copy = try cloneJsonValue(self.allocator, value);
-        errdefer deinitJsonValueDeep(self.allocator, &value_copy);
-
-        try self.contexts.put(key_copy, value_copy);
+        self.contexts.putAssumeCapacity(key_copy, value_copy.?);
+        committed = true;
     }
 
     /// Remove a context value.
@@ -1039,6 +1094,34 @@ test "Scope stores owned tag strings" {
     value_buf[0] = 'z';
 
     try testing.expectEqualStrings("one", scope.tags.get("key").?);
+}
+
+test "Scope setTag preserves previous value when allocation fails" {
+    var failing_allocator_state = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const failing_allocator = failing_allocator_state.allocator();
+
+    var scope = try Scope.init(failing_allocator, 10);
+    defer scope.deinit();
+
+    try scope.setTag("key", "one");
+    failing_allocator_state.fail_index = failing_allocator_state.alloc_index;
+
+    try testing.expectError(error.OutOfMemory, scope.setTag("key", "two"));
+    try testing.expectEqualStrings("one", scope.tags.get("key").?);
+}
+
+test "Scope setTransaction preserves previous value when allocation fails" {
+    var failing_allocator_state = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const failing_allocator = failing_allocator_state.allocator();
+
+    var scope = try Scope.init(failing_allocator, 10);
+    defer scope.deinit();
+
+    try scope.setTransaction("txn-a");
+    failing_allocator_state.fail_index = failing_allocator_state.alloc_index;
+
+    try testing.expectError(error.OutOfMemory, scope.setTransaction("txn-b"));
+    try testing.expectEqualStrings("txn-a", scope.transaction.?);
 }
 
 test "Scope clear resets all fields" {

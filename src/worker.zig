@@ -103,6 +103,12 @@ pub const Worker = struct {
 
     /// Spawn the background worker thread.
     pub fn start(self: *Worker) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.thread != null) return error.AlreadyStarted;
+        if (self.shutdown_flag) return error.AlreadyShutdown;
+
         self.thread = try std.Thread.spawn(.{}, workerLoop, .{self});
     }
 
@@ -320,6 +326,24 @@ test "Worker submit and process via background thread" {
     worker.shutdown();
 
     try testing.expectEqual(@as(usize, 2), test_send_count);
+}
+
+test "Worker start rejects repeated start calls" {
+    var worker = try Worker.init(testing.allocator, noopSendFn, null);
+    defer worker.deinit();
+
+    try worker.start();
+    defer worker.shutdown();
+
+    try testing.expectError(error.AlreadyStarted, worker.start());
+}
+
+test "Worker start rejects start after shutdown" {
+    var worker = try Worker.init(testing.allocator, noopSendFn, null);
+    defer worker.deinit();
+
+    worker.shutdown();
+    try testing.expectError(error.AlreadyShutdown, worker.start());
 }
 
 test "Worker drops oldest when queue full" {

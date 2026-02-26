@@ -15,6 +15,7 @@ var crash_file_path: [std.fs.max_path_bytes]u8 = undefined;
 var crash_file_path_len: usize = 0;
 var handlers_installed: bool = false;
 var install_ref_count: usize = 0;
+var install_mutex: std.Thread.Mutex = .{};
 
 const NUM_SIGNALS = 5;
 
@@ -93,6 +94,9 @@ fn signalHandler(sig: i32) callconv(.c) void {
 pub fn install(cache_dir: []const u8) void {
     if (!is_posix) return;
 
+    install_mutex.lock();
+    defer install_mutex.unlock();
+
     if (handlers_installed) {
         install_ref_count += 1;
         return;
@@ -128,6 +132,10 @@ pub fn install(cache_dir: []const u8) void {
 /// Uninstall signal handlers, restoring previous handlers.
 pub fn uninstall() void {
     if (!is_posix) return;
+
+    install_mutex.lock();
+    defer install_mutex.unlock();
+
     if (!handlers_installed) return;
 
     if (install_ref_count > 1) {
