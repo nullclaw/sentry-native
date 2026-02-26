@@ -113,6 +113,8 @@ pub fn main() !void {
   for transactions.
 - **Before-Send Hook** -- Optional `before_send` callback to inspect or drop
   events before they are enqueued.
+- **Before-Breadcrumb Hook** -- Optional `before_breadcrumb` callback to inspect
+  or drop breadcrumbs before they enter the scope buffer.
 - **Pure Zig** -- No libc, no C dependencies, no allocations outside the
   standard library allocator you provide.
 
@@ -130,7 +132,9 @@ All options are set via the `Options` struct passed to `sentry.init`:
 | `traces_sample_rate`      | `f64`                             | `0.0`                | Transaction sample rate (0.0 -- 1.0)     |
 | `max_breadcrumbs`         | `u32`                             | `100`                | Maximum breadcrumbs kept in scope        |
 | `before_send`             | `?*const fn (*Event) ?*Event`     | `null`               | Pre-send hook (return null to drop)      |
+| `before_breadcrumb`       | `?*const fn (Breadcrumb) ?Breadcrumb` | `null`           | Pre-breadcrumb hook (return null to drop)|
 | `cache_dir`               | `[]const u8`                      | `"/tmp/sentry-zig"`  | Directory for crash marker files         |
+| `user_agent`              | `[]const u8`                      | `"sentry-zig/0.1.0"` | User-Agent header for outbound requests  |
 | `install_signal_handlers` | `bool`                            | `true`               | Install POSIX crash signal handlers      |
 | `auto_session_tracking`   | `bool`                            | `false`              | Start a release-health session on init   |
 | `shutdown_timeout_ms`     | `u64`                             | `2000`               | Flush timeout used during `deinit`       |

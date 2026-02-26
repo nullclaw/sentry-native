@@ -18,8 +18,8 @@ const Scope = scope_mod.Scope;
 const Session = @import("session.zig").Session;
 const SessionStatus = @import("session.zig").SessionStatus;
 const Transport = @import("transport.zig").Transport;
-const SendResult = @import("transport.zig").SendResult;
 const Worker = @import("worker.zig").Worker;
+const SendOutcome = @import("worker.zig").SendOutcome;
 const signal_handler = @import("signal_handler.zig");
 const envelope = @import("envelope.zig");
 const txn_mod = @import("transaction.zig");
@@ -36,7 +36,9 @@ pub const Options = struct {
     traces_sample_rate: f64 = 0.0,
     max_breadcrumbs: u32 = 100,
     before_send: ?*const fn (*Event) ?*Event = null, // return null to drop
+    before_breadcrumb: ?*const fn (Breadcrumb) ?Breadcrumb = null, // return null to drop
     cache_dir: []const u8 = "/tmp/sentry-zig",
+    user_agent: []const u8 = "sentry-zig/0.1.0",
     install_signal_handlers: bool = true,
     auto_session_tracking: bool = false,
     shutdown_timeout_ms: u64 = 2000,
@@ -65,7 +67,7 @@ pub const Client = struct {
 
         const dsn = Dsn.parse(options.dsn) catch return error.InvalidDsn;
 
-        var transport = try Transport.init(allocator, dsn);
+        var transport = try Transport.init(allocator, dsn, options.user_agent);
         errdefer transport.deinit();
 
         var scope = try Scope.init(allocator, options.max_breadcrumbs);
@@ -146,22 +148,24 @@ pub const Client = struct {
     /// Core method: apply defaults, sample, apply scope, run before_send,
     /// serialize to envelope, and submit to the worker queue.
     pub fn captureEvent(self: *Client, event: *Event) void {
+        var prepared_event_value = event.*;
+
         // Apply defaults from options
         if (self.options.release) |release| {
-            if (event.release == null) event.release = release;
+            if (prepared_event_value.release == null) prepared_event_value.release = release;
         }
         if (self.options.environment) |env| {
-            if (event.environment == null) event.environment = env;
+            if (prepared_event_value.environment == null) prepared_event_value.environment = env;
         }
         if (self.options.server_name) |sn| {
-            if (event.server_name == null) event.server_name = sn;
+            if (prepared_event_value.server_name == null) prepared_event_value.server_name = sn;
         }
 
         // Apply scope to event
-        const applied = self.scope.applyToEvent(self.allocator, event) catch return;
-        defer scope_mod.cleanupAppliedToEvent(self.allocator, event, applied);
+        const applied = self.scope.applyToEvent(self.allocator, &prepared_event_value) catch return;
+        defer scope_mod.cleanupAppliedToEvent(self.allocator, &prepared_event_value, applied);
 
-        var prepared_event = event;
+        var prepared_event: *Event = &prepared_event_value;
 
         // Run before_send callback
         if (self.options.before_send) |before_send| {
@@ -237,7 +241,23 @@ pub const Client = struct {
 
     /// Add a breadcrumb.
     pub fn addBreadcrumb(self: *Client, crumb: Breadcrumb) void {
+        if (self.options.before_breadcrumb) |before_breadcrumb| {
+            if (before_breadcrumb(crumb)) |processed| {
+                self.scope.addBreadcrumb(processed);
+            }
+            return;
+        }
         self.scope.addBreadcrumb(crumb);
+    }
+
+    /// Remove an extra value.
+    pub fn removeExtra(self: *Client, key: []const u8) void {
+        self.scope.removeExtra(key);
+    }
+
+    /// Remove a context value.
+    pub fn removeContext(self: *Client, key: []const u8) void {
+        self.scope.removeContext(key);
     }
 
     // ─── Transaction Methods ─────────────────────────────────────────────
@@ -288,13 +308,15 @@ pub const Client = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // Match sentry-rust behavior: sessions require a configured release.
+        const release = self.options.release orelse return;
+
         // End any existing session first
         if (self.session) |*s| {
             s.end(.exited);
             _ = self.sendSessionUpdate(s);
         }
 
-        const release = self.options.release orelse "unknown";
         const environment = self.options.environment orelse "production";
         self.session = Session.start(release, environment);
     }
@@ -321,11 +343,13 @@ pub const Client = struct {
 
     // ─── Internal Helpers ────────────────────────────────────────────────
 
-    fn transportSendCallback(data: []const u8, ctx: ?*anyopaque) void {
+    fn transportSendCallback(data: []const u8, ctx: ?*anyopaque) SendOutcome {
         if (ctx) |ptr| {
             const client: *Client = @ptrCast(@alignCast(ptr));
-            _ = client.transport.send(data) catch {};
+            const send_result = client.transport.send(data) catch return .{};
+            return .{ .retry_after_secs = send_result.retry_after };
         }
+        return .{};
     }
 
     fn captureCrashEvent(self: *Client, signal_num: u32) void {
@@ -437,6 +461,8 @@ test "Options struct has correct defaults" {
     try testing.expect(opts.environment == null);
     try testing.expect(opts.server_name == null);
     try testing.expect(opts.before_send == null);
+    try testing.expect(opts.before_breadcrumb == null);
+    try testing.expectEqualStrings("sentry-zig/0.1.0", opts.user_agent);
     try testing.expect(opts.install_signal_handlers);
     try testing.expect(!opts.auto_session_tracking);
     try testing.expectEqual(@as(u64, 2000), opts.shutdown_timeout_ms);
@@ -449,4 +475,31 @@ test "Client struct size is non-zero" {
 
 test "Options struct size is non-zero" {
     try testing.expect(@sizeOf(Options) > 0);
+}
+
+fn dropBreadcrumb(_: Breadcrumb) ?Breadcrumb {
+    return null;
+}
+
+test "Client addBreadcrumb applies before_breadcrumb callback" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_breadcrumb = dropBreadcrumb,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.addBreadcrumb(.{ .message = "should-drop" });
+    try testing.expectEqual(@as(usize, 0), client.scope.breadcrumbs.count);
+}
+
+test "Client auto_session_tracking does not start session without release" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .auto_session_tracking = true,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.session == null);
 }

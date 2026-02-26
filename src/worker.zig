@@ -8,7 +8,11 @@ pub const WorkItem = struct {
     data: []u8,
 };
 
-pub const SendFn = *const fn ([]const u8, ?*anyopaque) void;
+pub const SendOutcome = struct {
+    retry_after_secs: ?u64 = null,
+};
+
+pub const SendFn = *const fn ([]const u8, ?*anyopaque) SendOutcome;
 
 /// Background worker thread that consumes work items from a thread-safe queue.
 pub const Worker = struct {
@@ -19,6 +23,7 @@ pub const Worker = struct {
     flush_condition: std.Thread.Condition = .{},
     shutdown_flag: bool = false,
     in_flight: usize = 0,
+    rate_limited_until_ns: ?i128 = null,
     thread: ?std.Thread = null,
     send_fn: SendFn,
     send_ctx: ?*anyopaque = null,
@@ -138,7 +143,23 @@ pub const Worker = struct {
 
             if (item) |work| {
                 defer self.allocator.free(work.data);
-                self.send_fn(work.data, self.send_ctx);
+
+                var should_send = true;
+                if (self.rate_limited_until_ns) |until| {
+                    const now = std.time.nanoTimestamp();
+                    if (now < until) {
+                        should_send = false;
+                    } else {
+                        self.rate_limited_until_ns = null;
+                    }
+                }
+
+                if (should_send) {
+                    const outcome = self.send_fn(work.data, self.send_ctx);
+                    if (outcome.retry_after_secs) |retry_after_secs| {
+                        self.rate_limited_until_ns = std.time.nanoTimestamp() + @as(i128, @intCast(retry_after_secs)) * std.time.ns_per_s;
+                    }
+                }
 
                 self.mutex.lock();
                 self.in_flight -= 1;
@@ -155,11 +176,23 @@ pub const Worker = struct {
 
 var test_send_count: usize = 0;
 
-fn testSendFn(_: []const u8, _: ?*anyopaque) void {
+fn testSendFn(_: []const u8, _: ?*anyopaque) SendOutcome {
     test_send_count += 1;
+    return .{};
 }
 
-fn noopSendFn(_: []const u8, _: ?*anyopaque) void {}
+fn noopSendFn(_: []const u8, _: ?*anyopaque) SendOutcome {
+    return .{};
+}
+
+fn rateLimitingSendFn(_: []const u8, ctx: ?*anyopaque) SendOutcome {
+    const counter: *usize = @ptrCast(@alignCast(ctx.?));
+    counter.* += 1;
+    if (counter.* == 1) {
+        return .{ .retry_after_secs = 1 };
+    }
+    return .{};
+}
 
 test "Worker submit and process via background thread" {
     test_send_count = 0;
@@ -223,4 +256,25 @@ test "Worker flush returns true when queue is empty" {
 
     // Empty queue => flush should return true immediately
     try testing.expect(worker.flush(100));
+}
+
+test "Worker drops queued items while rate limited" {
+    var send_count: usize = 0;
+
+    var worker = Worker.init(testing.allocator, rateLimitingSendFn, @ptrCast(&send_count));
+    defer worker.deinit();
+
+    try worker.start();
+
+    const first = try testing.allocator.dupe(u8, "first");
+    try worker.submit(first);
+
+    const second = try testing.allocator.dupe(u8, "second");
+    try worker.submit(second);
+
+    _ = worker.flush(1000);
+    worker.shutdown();
+
+    // First send triggers retry-after; second should be dropped by rate limit.
+    try testing.expectEqual(@as(usize, 1), send_count);
 }

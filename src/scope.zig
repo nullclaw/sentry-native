@@ -17,6 +17,10 @@ pub const ApplyResult = struct {
     extra_allocated: bool = false,
     contexts_allocated: bool = false,
     breadcrumbs_allocated: bool = false,
+    previous_tags: ?json.Value = null,
+    previous_extra: ?json.Value = null,
+    previous_contexts: ?json.Value = null,
+    previous_breadcrumbs: ?[]const Breadcrumb = null,
 };
 
 fn cloneOptionalString(allocator: Allocator, value: ?[]const u8) !?[]const u8 {
@@ -81,6 +85,32 @@ fn deinitJsonObjectDeep(allocator: Allocator, obj: *json.ObjectMap) void {
         deinitJsonValueDeep(allocator, entry.value_ptr);
     }
     obj.deinit();
+}
+
+fn cloneObjectInto(allocator: Allocator, dest: *json.ObjectMap, src: json.ObjectMap) !void {
+    var it = src.iterator();
+    while (it.next()) |entry| {
+        const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key_copy);
+
+        var value_copy = try cloneJsonValue(allocator, entry.value_ptr.*);
+        errdefer deinitJsonValueDeep(allocator, &value_copy);
+
+        try dest.put(key_copy, value_copy);
+    }
+}
+
+fn upsertOwnedObjectEntry(allocator: Allocator, obj: *json.ObjectMap, key: []const u8, value: json.Value) !void {
+    if (obj.fetchOrderedRemove(key)) |kv| {
+        allocator.free(@constCast(kv.key));
+        var old_value = kv.value;
+        deinitJsonValueDeep(allocator, &old_value);
+    }
+
+    const key_copy = try allocator.dupe(u8, key);
+    errdefer allocator.free(key_copy);
+
+    try obj.put(key_copy, value);
 }
 
 fn cloneJsonValue(allocator: Allocator, value: json.Value) !json.Value {
@@ -347,6 +377,18 @@ pub const Scope = struct {
         try self.extra.put(key_copy, value_copy);
     }
 
+    /// Remove an extra value.
+    pub fn removeExtra(self: *Scope, key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.extra.fetchRemove(key)) |kv| {
+            self.allocator.free(@constCast(kv.key));
+            var old_value = kv.value;
+            deinitJsonValueDeep(self.allocator, &old_value);
+        }
+    }
+
     /// Set a context (thread-safe).
     pub fn setContext(self: *Scope, key: []const u8, value: json.Value) !void {
         self.mutex.lock();
@@ -365,6 +407,18 @@ pub const Scope = struct {
         errdefer deinitJsonValueDeep(self.allocator, &value_copy);
 
         try self.contexts.put(key_copy, value_copy);
+    }
+
+    /// Remove a context value.
+    pub fn removeContext(self: *Scope, key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.contexts.fetchRemove(key)) |kv| {
+            self.allocator.free(@constCast(kv.key));
+            var old_value = kv.value;
+            deinitJsonValueDeep(self.allocator, &old_value);
+        }
     }
 
     /// Add a breadcrumb (thread-safe).
@@ -386,78 +440,93 @@ pub const Scope = struct {
 
         var result: ApplyResult = .{};
 
-        // Apply user.
-        if (self.user) |u| {
+        // Apply user only when event user is not set.
+        if (event.user == null and self.user != null) {
+            const u = self.user.?;
             event.user = try cloneUser(allocator, u);
             result.user_allocated = true;
         }
 
-        // Apply tags as json.Value object.
+        // Merge tags.
         if (self.tags.count() > 0) {
             var obj = json.ObjectMap.init(allocator);
             errdefer deinitJsonObjectDeep(allocator, &obj);
 
-            var it = self.tags.iterator();
-            while (it.next()) |entry| {
-                const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
-                errdefer allocator.free(key_copy);
+            if (event.tags) |existing_tags| {
+                if (existing_tags == .object) {
+                    try cloneObjectInto(allocator, &obj, existing_tags.object);
+                }
+            }
 
+            var scope_it = self.tags.iterator();
+            while (scope_it.next()) |entry| {
                 const value_copy = try allocator.dupe(u8, entry.value_ptr.*);
                 errdefer allocator.free(value_copy);
 
-                try obj.put(key_copy, .{ .string = value_copy });
+                try upsertOwnedObjectEntry(allocator, &obj, entry.key_ptr.*, .{ .string = value_copy });
             }
 
+            result.previous_tags = event.tags;
             event.tags = .{ .object = obj };
             result.tags_allocated = true;
         }
 
-        // Apply extra as json.Value object.
+        // Merge extra.
         if (self.extra.count() > 0) {
             var obj = json.ObjectMap.init(allocator);
             errdefer deinitJsonObjectDeep(allocator, &obj);
 
-            var it = self.extra.iterator();
-            while (it.next()) |entry| {
-                const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
-                errdefer allocator.free(key_copy);
+            if (event.extra) |existing_extra| {
+                if (existing_extra == .object) {
+                    try cloneObjectInto(allocator, &obj, existing_extra.object);
+                }
+            }
 
+            var scope_it = self.extra.iterator();
+            while (scope_it.next()) |entry| {
                 var value_copy = try cloneJsonValue(allocator, entry.value_ptr.*);
                 errdefer deinitJsonValueDeep(allocator, &value_copy);
 
-                try obj.put(key_copy, value_copy);
+                try upsertOwnedObjectEntry(allocator, &obj, entry.key_ptr.*, value_copy);
             }
 
+            result.previous_extra = event.extra;
             event.extra = .{ .object = obj };
             result.extra_allocated = true;
         }
 
-        // Apply contexts as json.Value object.
+        // Merge contexts.
         if (self.contexts.count() > 0) {
             var obj = json.ObjectMap.init(allocator);
             errdefer deinitJsonObjectDeep(allocator, &obj);
 
-            var it = self.contexts.iterator();
-            while (it.next()) |entry| {
-                const key_copy = try allocator.dupe(u8, entry.key_ptr.*);
-                errdefer allocator.free(key_copy);
+            if (event.contexts) |existing_contexts| {
+                if (existing_contexts == .object) {
+                    try cloneObjectInto(allocator, &obj, existing_contexts.object);
+                }
+            }
 
+            var scope_it = self.contexts.iterator();
+            while (scope_it.next()) |entry| {
                 var value_copy = try cloneJsonValue(allocator, entry.value_ptr.*);
                 errdefer deinitJsonValueDeep(allocator, &value_copy);
 
-                try obj.put(key_copy, value_copy);
+                try upsertOwnedObjectEntry(allocator, &obj, entry.key_ptr.*, value_copy);
             }
 
+            result.previous_contexts = event.contexts;
             event.contexts = .{ .object = obj };
             result.contexts_allocated = true;
         }
 
-        // Apply breadcrumbs.
+        // Merge breadcrumbs: event breadcrumbs first, scope breadcrumbs after.
         if (self.breadcrumbs.count > 0) {
             const ordered = try self.breadcrumbs.toSlice(allocator);
             defer allocator.free(ordered);
 
-            const crumbs = try allocator.alloc(Breadcrumb, ordered.len);
+            const existing_crumbs = event.breadcrumbs orelse &.{};
+            const total_len = existing_crumbs.len + ordered.len;
+            const crumbs = try allocator.alloc(Breadcrumb, total_len);
             var initialized: usize = 0;
             errdefer {
                 for (crumbs[0..initialized]) |*crumb| {
@@ -466,12 +535,17 @@ pub const Scope = struct {
                 allocator.free(crumbs);
             }
 
-            var i: usize = 0;
-            while (i < ordered.len) : (i += 1) {
-                crumbs[i] = try cloneBreadcrumb(allocator, ordered[i]);
+            for (existing_crumbs) |crumb| {
+                crumbs[initialized] = try cloneBreadcrumb(allocator, crumb);
                 initialized += 1;
             }
 
+            for (ordered) |crumb| {
+                crumbs[initialized] = try cloneBreadcrumb(allocator, crumb);
+                initialized += 1;
+            }
+
+            result.previous_breadcrumbs = event.breadcrumbs;
             event.breadcrumbs = crumbs;
             result.breadcrumbs_allocated = true;
         }
@@ -507,22 +581,22 @@ pub fn cleanupAppliedToEvent(allocator: Allocator, event: *Event, result: ApplyR
     if (result.tags_allocated) {
         if (event.tags) |*tags| {
             deinitJsonValueDeep(allocator, tags);
-            event.tags = null;
         }
+        event.tags = result.previous_tags;
     }
 
     if (result.extra_allocated) {
         if (event.extra) |*extra| {
             deinitJsonValueDeep(allocator, extra);
-            event.extra = null;
         }
+        event.extra = result.previous_extra;
     }
 
     if (result.contexts_allocated) {
         if (event.contexts) |*contexts| {
             deinitJsonValueDeep(allocator, contexts);
-            event.contexts = null;
         }
+        event.contexts = result.previous_contexts;
     }
 
     if (result.breadcrumbs_allocated) {
@@ -532,8 +606,8 @@ pub fn cleanupAppliedToEvent(allocator: Allocator, event: *Event, result: ApplyR
                 deinitBreadcrumbDeep(allocator, crumb);
             }
             allocator.free(mutable);
-            event.breadcrumbs = null;
         }
+        event.breadcrumbs = result.previous_breadcrumbs;
     }
 }
 
@@ -613,6 +687,68 @@ test "Scope applyToEvent" {
     try testing.expectEqualStrings("navigation", event.breadcrumbs.?[0].message.?);
 }
 
+test "Scope applyToEvent merges tags and breadcrumbs and restores originals on cleanup" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    try scope.setTag("scope", "2");
+    scope.addBreadcrumb(.{ .message = "scope-crumb", .category = "scope" });
+
+    var event = Event.init();
+    var event_tags = json.ObjectMap.init(testing.allocator);
+    try event_tags.put(try testing.allocator.dupe(u8, "event"), .{ .string = try testing.allocator.dupe(u8, "1") });
+    event.tags = .{ .object = event_tags };
+
+    const original_crumbs = [_]Breadcrumb{.{ .message = "event-crumb" }};
+    event.breadcrumbs = &original_crumbs;
+
+    const applied = try scope.applyToEvent(testing.allocator, &event);
+
+    // Merged tags should contain both keys.
+    try testing.expect(event.tags != null);
+    const merged_tags = event.tags.?.object;
+    try testing.expectEqualStrings("1", merged_tags.get("event").?.string);
+    try testing.expectEqualStrings("2", merged_tags.get("scope").?.string);
+
+    // Breadcrumbs should append scope entries after event entries.
+    try testing.expect(event.breadcrumbs != null);
+    try testing.expectEqual(@as(usize, 2), event.breadcrumbs.?.len);
+    try testing.expectEqualStrings("event-crumb", event.breadcrumbs.?[0].message.?);
+    try testing.expectEqualStrings("scope-crumb", event.breadcrumbs.?[1].message.?);
+
+    cleanupAppliedToEvent(testing.allocator, &event, applied);
+
+    // Original fields are restored.
+    try testing.expect(event.tags != null);
+    try testing.expect(event.breadcrumbs != null);
+    try testing.expectEqual(@as(usize, 1), event.breadcrumbs.?.len);
+    try testing.expectEqualStrings("event-crumb", event.breadcrumbs.?[0].message.?);
+
+    // Cleanup original event tags.
+    if (event.tags) |*tags| {
+        deinitJsonValueDeep(testing.allocator, tags);
+        event.tags = null;
+    }
+    event.breadcrumbs = null;
+}
+
+test "Scope applyToEvent does not override existing event user" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    scope.setUser(.{ .id = "scope-user" });
+
+    var event = Event.init();
+    event.user = .{ .id = "event-user" };
+
+    const applied = try scope.applyToEvent(testing.allocator, &event);
+    defer cleanupAppliedToEvent(testing.allocator, &event, applied);
+
+    try testing.expect(event.user != null);
+    try testing.expectEqualStrings("event-user", event.user.?.id.?);
+    try testing.expect(!applied.user_allocated);
+}
+
 test "Scope stores owned tag strings" {
     var scope = try Scope.init(testing.allocator, 10);
     defer scope.deinit();
@@ -641,4 +777,21 @@ test "Scope clear resets all fields" {
     try testing.expect(scope.user == null);
     try testing.expectEqual(@as(usize, 0), scope.tags.count());
     try testing.expectEqual(@as(usize, 0), scope.breadcrumbs.count);
+}
+
+test "Scope removeExtra and removeContext remove owned values" {
+    var scope = try Scope.init(testing.allocator, 10);
+    defer scope.deinit();
+
+    try scope.setExtra("extra-key", .{ .string = "extra-value" });
+    try scope.setContext("ctx-key", .{ .integer = 42 });
+
+    try testing.expect(scope.extra.get("extra-key") != null);
+    try testing.expect(scope.contexts.get("ctx-key") != null);
+
+    scope.removeExtra("extra-key");
+    scope.removeContext("ctx-key");
+
+    try testing.expect(scope.extra.get("extra-key") == null);
+    try testing.expect(scope.contexts.get("ctx-key") == null);
 }

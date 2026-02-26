@@ -14,18 +14,22 @@ pub const Transport = struct {
     allocator: Allocator,
     dsn: Dsn,
     envelope_url: []u8, // allocated
-    user_agent: []const u8 = "sentry-zig/0.1.0",
+    user_agent: []u8, // allocated
     http_client: std.http.Client,
 
     /// Initialize a Transport from a parsed Dsn.
-    pub fn init(allocator: Allocator, dsn: Dsn) !Transport {
+    pub fn init(allocator: Allocator, dsn: Dsn, user_agent: []const u8) !Transport {
         const base_url = try dsn.getEnvelopeUrl(allocator);
         defer allocator.free(base_url);
         const envelope_url = try std.fmt.allocPrint(allocator, "{s}?sentry_key={s}", .{ base_url, dsn.public_key });
+        errdefer allocator.free(envelope_url);
+
+        const user_agent_copy = try allocator.dupe(u8, user_agent);
         return Transport{
             .allocator = allocator,
             .dsn = dsn,
             .envelope_url = envelope_url,
+            .user_agent = user_agent_copy,
             .http_client = .{ .allocator = allocator },
         };
     }
@@ -34,6 +38,7 @@ pub const Transport = struct {
     pub fn deinit(self: *Transport) void {
         self.http_client.deinit();
         self.allocator.free(self.envelope_url);
+        self.allocator.free(self.user_agent);
         self.* = undefined;
     }
 
@@ -150,9 +155,17 @@ test "MockTransport.lastSent returns last sent item" {
 
 test "Transport init and deinit" {
     const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
-    var transport = try Transport.init(testing.allocator, dsn);
+    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.1.0");
     defer transport.deinit();
 
     try testing.expectEqualStrings("https://o0.ingest.sentry.io/api/1234567/envelope/?sentry_key=examplePublicKey", transport.envelope_url);
     try testing.expectEqualStrings("sentry-zig/0.1.0", transport.user_agent);
+}
+
+test "Transport stores custom user agent" {
+    const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
+    var transport = try Transport.init(testing.allocator, dsn, "my-sdk/9.9.9");
+    defer transport.deinit();
+
+    try testing.expectEqualStrings("my-sdk/9.9.9", transport.user_agent);
 }
