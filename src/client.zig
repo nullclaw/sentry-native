@@ -83,6 +83,7 @@ pub const Options = struct {
     dsn: []const u8,
     debug: bool = false,
     release: ?[]const u8 = null,
+    dist: ?[]const u8 = null,
     environment: ?[]const u8 = null,
     server_name: ?[]const u8 = null,
     sample_rate: f64 = 1.0,
@@ -315,6 +316,9 @@ pub const Client = struct {
         // Apply defaults from options
         if (self.options.release) |release| {
             if (prepared_event_value.release == null) prepared_event_value.release = release;
+        }
+        if (self.options.dist) |dist| {
+            if (prepared_event_value.dist == null) prepared_event_value.dist = dist;
         }
         if (self.options.environment) |env| {
             if (prepared_event_value.environment == null) prepared_event_value.environment = env;
@@ -573,6 +577,7 @@ pub const Client = struct {
 
         // Apply defaults from client options
         if (real_opts.release == null) real_opts.release = self.options.release;
+        if (real_opts.dist == null) real_opts.dist = self.options.dist;
         if (real_opts.environment == null) real_opts.environment = self.options.environment;
 
         const effective_sample_rate: f64 = blk: {
@@ -1222,6 +1227,7 @@ test "Options struct has correct defaults" {
     try testing.expect(opts.default_integrations);
     try testing.expect(opts.integrations == null);
     try testing.expect(opts.release == null);
+    try testing.expect(opts.dist == null);
     try testing.expect(opts.environment == null);
     try testing.expect(opts.server_name == null);
     try testing.expect(opts.before_send == null);
@@ -1410,6 +1416,7 @@ var before_send_saw_os_context: bool = false;
 var before_send_saw_threads: bool = false;
 var before_send_first_frame_in_app: ?bool = null;
 var before_send_observed_server_name: ?[]const u8 = null;
+var before_send_observed_dist: ?[]const u8 = null;
 
 fn inspectTraceContextBeforeSend(event: *Event) ?*Event {
     before_send_saw_trace_context = hasTraceContext(event);
@@ -1439,6 +1446,11 @@ fn inspectInAppBeforeSend(event: *Event) ?*Event {
 
 fn inspectServerNameBeforeSend(event: *Event) ?*Event {
     before_send_observed_server_name = event.server_name;
+    return event;
+}
+
+fn inspectDistBeforeSend(event: *Event) ?*Event {
+    before_send_observed_dist = event.dist;
     return event;
 }
 
@@ -1543,6 +1555,40 @@ test "Client explicit server_name takes precedence over fallback server_name" {
     try testing.expect(client.captureMessageId("server-name-explicit", .info) != null);
     try testing.expect(before_send_observed_server_name != null);
     try testing.expectEqualStrings("explicit-host", before_send_observed_server_name.?);
+}
+
+test "Client default dist is applied to events when unset" {
+    before_send_observed_dist = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .dist = "42",
+        .before_send = inspectDistBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureMessageId("default-dist", .info) != null);
+    try testing.expect(before_send_observed_dist != null);
+    try testing.expectEqualStrings("42", before_send_observed_dist.?);
+}
+
+test "Client explicit event dist takes precedence over option dist" {
+    before_send_observed_dist = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .dist = "42",
+        .before_send = inspectDistBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var event = Event.initMessage("custom-dist", .info);
+    event.dist = "custom";
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expect(before_send_observed_dist != null);
+    try testing.expectEqualStrings("custom", before_send_observed_dist.?);
 }
 
 test "Client in_app_include marks matching exception frames as in_app=true" {
@@ -1726,6 +1772,67 @@ test "Client serializeTransactionEnvelope adds dynamic sampling trace header" {
     try testing.expect(std.mem.indexOf(u8, serialized, "\"public_key\":\"examplePublicKey\"") != null);
     try testing.expect(std.mem.indexOf(u8, serialized, "\"sample_rate\":1.000000") != null);
     try testing.expect(std.mem.indexOf(u8, serialized, "\"sampled\":true") != null);
+}
+
+test "Client default dist is applied to transactions when unset" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .dist = "42",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "GET /dist-default",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"dist\":\"42\"") != null);
+}
+
+test "Client explicit transaction dist takes precedence over option dist" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .dist = "42",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "GET /dist-override",
+        .op = "http.server",
+        .dist = "custom",
+    });
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"dist\":\"custom\"") != null);
 }
 
 test "Client serializeLogEnvelope writes log item type" {

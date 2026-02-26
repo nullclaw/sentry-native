@@ -185,6 +185,7 @@ All options are provided via `sentry.Options` in `sentry.init`.
 | `dsn` | `[]const u8` | required | Sentry DSN |
 | `debug` | `bool` | `false` | Debug flag |
 | `release` | `?[]const u8` | `null` | Release identifier |
+| `dist` | `?[]const u8` | `null` | Distribution/build identifier applied to events and transactions |
 | `environment` | `?[]const u8` | `null` | Environment name |
 | `server_name` | `?[]const u8` | `null` | Host/server name |
 | `sample_rate` | `f64` | `1.0` | Event sampling (`0.0..1.0`) |

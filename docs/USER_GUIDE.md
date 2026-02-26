@@ -477,6 +477,7 @@ Configuration:
 ## Production Checklist
 
 - Set `release`, `environment`, and `server_name` explicitly.
+- Set `dist` when multiple build distributions share the same release.
 - Configure sampling: `sample_rate`, `traces_sample_rate`/`traces_sampler`.
 - Add `before_send` to edit/filter payloads.
 - Add breadcrumbs at critical CJM stages.

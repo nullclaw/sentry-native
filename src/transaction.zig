@@ -79,6 +79,7 @@ pub const TransactionOpts = struct {
     sampled: bool = true,
     sample_rate: f64 = 1.0,
     release: ?[]const u8 = null,
+    dist: ?[]const u8 = null,
     environment: ?[]const u8 = null,
     parent_trace_id: ?[32]u8 = null,
     parent_span_id: ?SpanId = null,
@@ -128,6 +129,7 @@ pub const Transaction = struct {
     sample_rate: f64 = 1.0,
     parent_sampled: ?bool = null,
     release: ?[]const u8 = null,
+    dist: ?[]const u8 = null,
     environment: ?[]const u8 = null,
     incoming_baggage: ?[]u8 = null,
 
@@ -148,6 +150,7 @@ pub const Transaction = struct {
             .sample_rate = opts.sample_rate,
             .parent_sampled = opts.parent_sampled,
             .release = opts.release,
+            .dist = opts.dist,
             .environment = opts.environment,
         };
     }
@@ -241,6 +244,11 @@ pub const Transaction = struct {
         if (self.release) |release| {
             try w.writeAll(",\"release\":");
             try json.Stringify.value(release, .{}, w);
+        }
+
+        if (self.dist) |dist| {
+            try w.writeAll(",\"dist\":");
+            try json.Stringify.value(dist, .{}, w);
         }
 
         if (self.environment) |env| {
@@ -430,6 +438,7 @@ test "Transaction.toJson produces valid JSON with transaction name, op, spans ar
         .name = "GET /api",
         .op = "http.server",
         .release = "my-app@1.0.0",
+        .dist = "42",
         .environment = "production",
     });
     defer txn.deinit();
@@ -460,6 +469,8 @@ test "Transaction.toJson produces valid JSON with transaction name, op, spans ar
     try testing.expect(std.mem.indexOf(u8, json_str, "\"platform\":\"other\"") != null);
     // Verify release
     try testing.expect(std.mem.indexOf(u8, json_str, "\"release\":\"my-app@1.0.0\"") != null);
+    // Verify dist
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"dist\":\"42\"") != null);
     // Verify environment
     try testing.expect(std.mem.indexOf(u8, json_str, "\"environment\":\"production\"") != null);
 }

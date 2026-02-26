@@ -572,6 +572,7 @@ test "CJM e2e: event with scope and attachment reaches relay" {
     const client = try sentry.init(testing.allocator, .{
         .dsn = local_dsn,
         .release = "checkout@1.2.3",
+        .dist = "42",
         .environment = "staging",
         .install_signal_handlers = false,
     });
@@ -600,6 +601,7 @@ test "CJM e2e: event with scope and attachment reaches relay" {
     try testing.expect(relay.containsInAny("\"type\":\"event\""));
     try testing.expect(relay.containsInAny("\"checkout failed\""));
     try testing.expect(relay.containsInAny("\"release\":\"checkout@1.2.3\""));
+    try testing.expect(relay.containsInAny("\"dist\":\"42\""));
     try testing.expect(relay.containsInAny("\"environment\":\"staging\""));
     try testing.expect(relay.containsInAny("\"user\":{\"id\":\"user-42\""));
     try testing.expect(relay.containsInAny("\"tags\":{\"cjm\":\"checkout\""));
@@ -642,6 +644,7 @@ test "CJM e2e: transaction is sent when traces sample rate is enabled" {
     const client = try sentry.init(testing.allocator, .{
         .dsn = local_dsn,
         .release = "checkout@1.2.3",
+        .dist = "42",
         .environment = "staging",
         .traces_sample_rate = 1.0,
         .install_signal_handlers = false,
@@ -671,6 +674,7 @@ test "CJM e2e: transaction is sent when traces sample rate is enabled" {
     try testing.expect(relay.containsInAny("\"trace\":{"));
     try testing.expect(relay.containsInAny("\"sample_rate\":1.000000"));
     try testing.expect(relay.containsInAny("\"release\":\"checkout@1.2.3\""));
+    try testing.expect(relay.containsInAny("\"dist\":\"42\""));
     try testing.expect(relay.containsInAny("\"environment\":\"staging\""));
 }
 
