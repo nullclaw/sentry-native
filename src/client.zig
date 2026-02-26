@@ -2464,6 +2464,7 @@ test "Client finishTransaction applies scope tags extra and contexts" {
     });
     defer client.deinit();
 
+    client.setUser(.{ .id = "scope-user" });
     try client.trySetTag("scope-flow", "checkout");
     try client.trySetExtra("scope-attempt", .{ .integer = 3 });
     try client.trySetContext("scope-context", .{ .integer = 9 });
@@ -2479,6 +2480,7 @@ test "Client finishTransaction applies scope tags extra and contexts" {
 
     try testing.expectEqual(@as(usize, 1), state.sent_count);
     try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"user\":{\"id\":\"scope-user\"}") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"scope-flow\":\"checkout\"") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"scope-attempt\":3") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"scope-context\":9") != null);

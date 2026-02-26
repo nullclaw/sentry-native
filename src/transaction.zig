@@ -5,6 +5,7 @@ const json = std.json;
 const Writer = std.io.Writer;
 
 const scope_mod = @import("scope.zig");
+const User = @import("event.zig").User;
 const Uuid = @import("uuid.zig").Uuid;
 const ts = @import("timestamp.zig");
 
@@ -209,6 +210,37 @@ pub const Request = struct {
     env: ?json.Value = null,
 };
 
+fn cloneOptionalString(allocator: Allocator, value: ?[]const u8) !?[]const u8 {
+    if (value) |v| return try allocator.dupe(u8, v);
+    return null;
+}
+
+fn deinitOptionalString(allocator: Allocator, value: *?[]const u8) void {
+    if (value.*) |v| {
+        allocator.free(@constCast(v));
+        value.* = null;
+    }
+}
+
+fn cloneUserOwned(allocator: Allocator, user: User) !User {
+    var copy: User = .{};
+    copy.id = try cloneOptionalString(allocator, user.id);
+    errdefer deinitUserOwned(allocator, &copy);
+    copy.email = try cloneOptionalString(allocator, user.email);
+    copy.username = try cloneOptionalString(allocator, user.username);
+    copy.ip_address = try cloneOptionalString(allocator, user.ip_address);
+    copy.segment = try cloneOptionalString(allocator, user.segment);
+    return copy;
+}
+
+fn deinitUserOwned(allocator: Allocator, user: *User) void {
+    deinitOptionalString(allocator, &user.id);
+    deinitOptionalString(allocator, &user.email);
+    deinitOptionalString(allocator, &user.username);
+    deinitOptionalString(allocator, &user.ip_address);
+    deinitOptionalString(allocator, &user.segment);
+}
+
 /// Options for creating a transaction.
 pub const TransactionOpts = struct {
     name: []const u8,
@@ -356,6 +388,7 @@ pub const Transaction = struct {
     contexts: std.StringHashMap(json.Value),
     origin: ?[]u8 = null,
     request: ?json.Value = null,
+    user: ?User = null,
     allocator: Allocator,
     sampled: bool = true,
     sample_rate: f64 = 1.0,
@@ -402,6 +435,10 @@ pub const Transaction = struct {
         if (self.request) |*value| {
             scope_mod.deinitJsonValueDeep(self.allocator, value);
             self.request = null;
+        }
+        if (self.user) |*value| {
+            deinitUserOwned(self.allocator, value);
+            self.user = null;
         }
         for (self.spans.items) |span| {
             span.deinit();
@@ -559,6 +596,17 @@ pub const Transaction = struct {
         self.request = .{ .object = obj };
     }
 
+    pub fn setUser(self: *Transaction, user: User) !void {
+        var replacement = try cloneUserOwned(self.allocator, user);
+        errdefer deinitUserOwned(self.allocator, &replacement);
+
+        if (self.user) |*existing| {
+            deinitUserOwned(self.allocator, existing);
+            self.user = null;
+        }
+        self.user = replacement;
+    }
+
     /// Serialize the transaction to JSON for envelope payload.
     pub fn toJson(self: *const Transaction, allocator: Allocator) ![]u8 {
         var aw: Writer.Allocating = .init(allocator);
@@ -651,6 +699,11 @@ pub const Transaction = struct {
         if (self.request) |request| {
             try w.writeAll(",\"request\":");
             try json.Stringify.value(request, .{}, w);
+        }
+
+        if (self.user) |user| {
+            try w.writeAll(",\"user\":");
+            try json.Stringify.value(user, .{ .emit_null_optional_fields = false }, w);
         }
 
         // Spans array
@@ -1156,6 +1209,7 @@ test "Transaction metadata setters serialize trace data tags extra and origin" {
     try txn.setTag("flow", "checkout");
     try txn.setExtra("attempt", .{ .integer = 2 });
     try txn.setData("cache_hit", .{ .bool = true });
+    try txn.setUser(.{ .id = "user-42", .email = "buyer@example.com" });
     var app_context: json.Value = .{ .object = blk: {
         var obj = json.ObjectMap.init(testing.allocator);
         const key = try testing.allocator.dupe(u8, "name");
@@ -1186,6 +1240,8 @@ test "Transaction metadata setters serialize trace data tags extra and origin" {
     try testing.expect(std.mem.indexOf(u8, json_str, "\"cache_hit\":true") != null);
     try testing.expect(std.mem.indexOf(u8, json_str, "\"app\":{") != null);
     try testing.expect(std.mem.indexOf(u8, json_str, "\"name\":\"checkout\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"user\":{\"id\":\"user-42\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"email\":\"buyer@example.com\"") != null);
 }
 
 test "Transaction setContext does not override trace context" {

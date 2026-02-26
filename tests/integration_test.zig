@@ -771,6 +771,7 @@ test "CJM e2e: client scope enriches transaction metadata" {
     });
     defer client.deinit();
 
+    client.setUser(.{ .id = "scope-user" });
     try client.trySetTag("scope-flow", "checkout");
     try client.trySetExtra("scope-attempt", .{ .integer = 4 });
     try client.trySetContext("scope-context", .{ .integer = 8 });
@@ -786,6 +787,7 @@ test "CJM e2e: client scope enriches transaction metadata" {
     try testing.expect(relay.waitForAtLeast(1, 2000));
 
     try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"user\":{\"id\":\"scope-user\"}"));
     try testing.expect(relay.containsInAny("\"scope-flow\":\"checkout\""));
     try testing.expect(relay.containsInAny("\"scope-attempt\":4"));
     try testing.expect(relay.containsInAny("\"scope-context\":8"));
