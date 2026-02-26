@@ -5,6 +5,9 @@ const json = std.json;
 
 const client_mod = @import("client.zig");
 const Client = client_mod.Client;
+const Integration = client_mod.Integration;
+const IntegrationSetupFn = client_mod.IntegrationSetupFn;
+const IntegrationLookupCallback = client_mod.IntegrationLookupCallback;
 const Transaction = @import("transaction.zig").Transaction;
 const TransactionOpts = @import("transaction.zig").TransactionOpts;
 const PropagationHeader = @import("propagation.zig").PropagationHeader;
@@ -83,6 +86,14 @@ pub const Hub = struct {
         try self.pushScope();
         defer _ = self.popScope();
         callback(self);
+    }
+
+    pub fn withIntegration(
+        self: *Hub,
+        setup: IntegrationSetupFn,
+        callback: IntegrationLookupCallback,
+    ) bool {
+        return self.client.withIntegration(setup, callback);
     }
 
     /// Configure current scope by applying callback on a staged copy and
@@ -369,6 +380,30 @@ fn configureScopeSetTag(scope: *Scope) void {
     scope.setTag("scope", "configured") catch {};
 }
 
+var hub_integration_lookup_called: bool = false;
+var hub_integration_lookup_received_null: bool = false;
+var hub_integration_lookup_flag_value: ?bool = null;
+
+fn hubIntegrationSetup(_: *Client, ctx: ?*anyopaque) void {
+    if (ctx) |ptr| {
+        const flag: *bool = @ptrCast(@alignCast(ptr));
+        flag.* = true;
+    }
+}
+
+fn inspectHubIntegrationLookup(ctx: ?*anyopaque) void {
+    hub_integration_lookup_called = true;
+    hub_integration_lookup_received_null = (ctx == null);
+    if (ctx) |ptr| {
+        const flag: *bool = @ptrCast(@alignCast(ptr));
+        hub_integration_lookup_flag_value = flag.*;
+    } else {
+        hub_integration_lookup_flag_value = null;
+    }
+}
+
+fn otherHubIntegrationSetup(_: *Client, _: ?*anyopaque) void {}
+
 test "Hub push/pop scope isolates mutations" {
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
@@ -468,6 +503,57 @@ test "Hub configureScope applies staged mutation to current scope" {
     try hub.trySetTag("scope", "outer");
     hub.configureScope(configureScopeSetTag);
     try testing.expectEqualStrings("configured", hub.currentScope().tags.get("scope").?);
+}
+
+test "Hub withIntegration returns configured integration context" {
+    hub_integration_lookup_called = false;
+    hub_integration_lookup_received_null = false;
+    hub_integration_lookup_flag_value = null;
+
+    var integration_flag = false;
+    const integration = Integration{
+        .setup = hubIntegrationSetup,
+        .ctx = &integration_flag,
+    };
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .integrations = &.{integration},
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    try testing.expect(hub.withIntegration(hubIntegrationSetup, inspectHubIntegrationLookup));
+    try testing.expect(hub_integration_lookup_called);
+    try testing.expect(!hub_integration_lookup_received_null);
+    try testing.expectEqual(@as(?bool, true), hub_integration_lookup_flag_value);
+}
+
+test "Hub withIntegration reports missing integration as null" {
+    hub_integration_lookup_called = false;
+    hub_integration_lookup_received_null = false;
+    hub_integration_lookup_flag_value = null;
+
+    const integration = Integration{
+        .setup = hubIntegrationSetup,
+        .ctx = null,
+    };
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .integrations = &.{integration},
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+
+    try testing.expect(!hub.withIntegration(otherHubIntegrationSetup, inspectHubIntegrationLookup));
+    try testing.expect(hub_integration_lookup_called);
+    try testing.expect(hub_integration_lookup_received_null);
+    try testing.expectEqual(@as(?bool, null), hub_integration_lookup_flag_value);
 }
 
 test "Hub startTransactionFromPropagationHeaders continues upstream trace" {

@@ -66,12 +66,14 @@ pub const TracesSamplingContext = struct {
     parent_sampled: ?bool = null,
 };
 
+pub const IntegrationSetupFn = *const fn (*Client, ?*anyopaque) void;
+pub const IntegrationLookupCallback = *const fn (?*anyopaque) void;
 pub const TracesSampler = *const fn (TracesSamplingContext) f64;
 pub const BeforeSendLog = *const fn (*LogEntry) ?*LogEntry;
 pub const BeforeSendTransaction = *const fn (*Transaction) ?*Transaction;
 pub const TransportSendFn = *const fn ([]const u8, ?*anyopaque) SendOutcome;
 pub const Integration = struct {
-    setup: *const fn (*Client, ?*anyopaque) void,
+    setup: IntegrationSetupFn,
     ctx: ?*anyopaque = null,
 };
 pub const TransportConfig = struct {
@@ -567,6 +569,26 @@ pub const Client = struct {
     /// Remove all scope event processors.
     pub fn clearEventProcessors(self: *Client) void {
         self.scope.clearEventProcessors();
+    }
+
+    /// Run callback with context pointer for the integration matching `setup`.
+    /// Returns true when such integration exists.
+    pub fn withIntegration(
+        self: *const Client,
+        setup: IntegrationSetupFn,
+        callback: IntegrationLookupCallback,
+    ) bool {
+        if (self.options.integrations) |integrations| {
+            for (integrations) |integration| {
+                if (integration.setup == setup) {
+                    callback(integration.ctx);
+                    return true;
+                }
+            }
+        }
+
+        callback(null);
+        return false;
     }
 
     /// Remove an extra value.
@@ -1394,6 +1416,70 @@ test "Client runs configured integration setup callbacks on init" {
     defer client.deinit();
 
     try testing.expect(called);
+}
+
+var integration_lookup_called: bool = false;
+var integration_lookup_received_null: bool = false;
+var integration_lookup_flag_value: ?bool = null;
+
+fn inspectIntegrationLookup(ctx: ?*anyopaque) void {
+    integration_lookup_called = true;
+    integration_lookup_received_null = (ctx == null);
+    if (ctx) |ptr| {
+        const value: *bool = @ptrCast(@alignCast(ptr));
+        integration_lookup_flag_value = value.*;
+    } else {
+        integration_lookup_flag_value = null;
+    }
+}
+
+fn otherIntegrationSetup(_: *Client, _: ?*anyopaque) void {}
+
+test "Client withIntegration finds configured integration context" {
+    integration_lookup_called = false;
+    integration_lookup_received_null = false;
+    integration_lookup_flag_value = null;
+
+    var called = false;
+    const integration = Integration{
+        .setup = testIntegrationSetup,
+        .ctx = &called,
+    };
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .integrations = &.{integration},
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.withIntegration(testIntegrationSetup, inspectIntegrationLookup));
+    try testing.expect(integration_lookup_called);
+    try testing.expect(!integration_lookup_received_null);
+    try testing.expectEqual(@as(?bool, true), integration_lookup_flag_value);
+}
+
+test "Client withIntegration reports null context when integration is missing" {
+    integration_lookup_called = false;
+    integration_lookup_received_null = false;
+    integration_lookup_flag_value = null;
+
+    const integration = Integration{
+        .setup = otherIntegrationSetup,
+        .ctx = null,
+    };
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .integrations = &.{integration},
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(!client.withIntegration(testIntegrationSetup, inspectIntegrationLookup));
+    try testing.expect(integration_lookup_called);
+    try testing.expect(integration_lookup_received_null);
+    try testing.expectEqual(@as(?bool, null), integration_lookup_flag_value);
 }
 
 fn dropBreadcrumb(_: Breadcrumb) ?Breadcrumb {

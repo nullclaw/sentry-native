@@ -23,6 +23,8 @@ pub const BeforeSendLog = @import("client.zig").BeforeSendLog;
 pub const BeforeSendTransaction = @import("client.zig").BeforeSendTransaction;
 pub const TransportConfig = @import("client.zig").TransportConfig;
 pub const Integration = @import("client.zig").Integration;
+pub const IntegrationSetupFn = @import("client.zig").IntegrationSetupFn;
+pub const IntegrationLookupCallback = @import("client.zig").IntegrationLookupCallback;
 pub const Event = @import("event.zig").Event;
 pub const Level = @import("event.zig").Level;
 pub const User = @import("event.zig").User;
@@ -223,6 +225,14 @@ pub fn withScope(callback: *const fn (*Hub) void) bool {
     return true;
 }
 
+pub fn withIntegration(setup: IntegrationSetupFn, callback: IntegrationLookupCallback) bool {
+    const hub = Hub.current() orelse {
+        callback(null);
+        return false;
+    };
+    return hub.withIntegration(setup, callback);
+}
+
 pub fn configureScope(callback: *const fn (*Scope) void) bool {
     const hub = Hub.current() orelse return false;
     hub.tryConfigureScope(callback) catch return false;
@@ -242,7 +252,33 @@ fn configureScopeSetInner(scope: *Scope) void {
     scope.setTag("which_scope", "scope2") catch {};
 }
 
+var global_integration_lookup_called: bool = false;
+var global_integration_lookup_received_null: bool = false;
+var global_integration_lookup_flag_value: ?bool = null;
+
+fn testGlobalIntegrationSetup(_: *Client, ctx: ?*anyopaque) void {
+    if (ctx) |ptr| {
+        const flag: *bool = @ptrCast(@alignCast(ptr));
+        flag.* = true;
+    }
+}
+
+fn inspectGlobalIntegrationLookup(ctx: ?*anyopaque) void {
+    global_integration_lookup_called = true;
+    global_integration_lookup_received_null = (ctx == null);
+    if (ctx) |ptr| {
+        const flag: *bool = @ptrCast(@alignCast(ptr));
+        global_integration_lookup_flag_value = flag.*;
+    } else {
+        global_integration_lookup_flag_value = null;
+    }
+}
+
 test "global wrappers are safe no-op without current hub" {
+    global_integration_lookup_called = false;
+    global_integration_lookup_received_null = false;
+    global_integration_lookup_flag_value = null;
+
     try std.testing.expect(currentHub() == null);
     try std.testing.expect(captureMessage("no-hub", .info) == null);
     try std.testing.expect(captureException("TypeError", "no-hub") == null);
@@ -267,6 +303,9 @@ test "global wrappers are safe no-op without current hub" {
     try std.testing.expect(!pushScope());
     try std.testing.expect(!popScope());
     try std.testing.expect(!configureScope(configureScopeSetInner));
+    try std.testing.expect(!withIntegration(testGlobalIntegrationSetup, inspectGlobalIntegrationLookup));
+    try std.testing.expect(global_integration_lookup_called);
+    try std.testing.expect(global_integration_lookup_received_null);
     try std.testing.expect(!startSession());
     try std.testing.expect(!endSession(.exited));
     try std.testing.expect(!flush(1));
@@ -279,9 +318,15 @@ test "global wrappers are safe no-op without current hub" {
 }
 
 test "global wrappers route through current hub" {
+    var integration_flag = false;
+    const integration = Integration{
+        .setup = testGlobalIntegrationSetup,
+        .ctx = &integration_flag,
+    };
     const client = try Client.init(std.testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
         .release = "my-app@1.0.0",
+        .integrations = &.{integration},
         .install_signal_handlers = false,
     });
     defer client.deinit();
@@ -303,6 +348,14 @@ test "global wrappers route through current hub" {
 
     try std.testing.expect(withScope(withScopeSetTag));
     try std.testing.expect(hub.currentScope().tags.get("scope") == null);
+
+    global_integration_lookup_called = false;
+    global_integration_lookup_received_null = true;
+    global_integration_lookup_flag_value = null;
+    try std.testing.expect(withIntegration(testGlobalIntegrationSetup, inspectGlobalIntegrationLookup));
+    try std.testing.expect(global_integration_lookup_called);
+    try std.testing.expect(!global_integration_lookup_received_null);
+    try std.testing.expectEqual(@as(?bool, true), global_integration_lookup_flag_value);
 
     try std.testing.expect(configureScope(configureScopeSetOuter));
     try std.testing.expectEqualStrings("scope1", hub.currentScope().tags.get("which_scope").?);

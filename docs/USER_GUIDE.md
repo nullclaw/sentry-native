@@ -191,6 +191,7 @@ After `setCurrentHub`, you can use global helper calls:
 - `sentry.pushScope()` / `sentry.popScope()`
 - `sentry.withScope(...)`
 - `sentry.configureScope(...)`
+- `sentry.withIntegration(...)`
 
 ## Attachments
 
