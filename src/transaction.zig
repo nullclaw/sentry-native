@@ -7,6 +7,8 @@ const Writer = std.io.Writer;
 const Uuid = @import("uuid.zig").Uuid;
 const ts = @import("timestamp.zig");
 
+pub const MAX_SPANS: usize = 1000;
+
 /// A span ID is 16 hex characters (8 random bytes).
 pub const SpanId = [16]u8;
 
@@ -100,7 +102,12 @@ pub const Span = struct {
 
     /// Finish the span, setting timestamp and defaulting status to ok.
     pub fn finish(self: *Span) void {
-        self.timestamp = ts.now();
+        self.finishWithTimestamp(ts.now());
+    }
+
+    /// Finish the span with an explicit timestamp, defaulting status to ok.
+    pub fn finishWithTimestamp(self: *Span, timestamp: f64) void {
+        self.timestamp = timestamp;
         if (self.status == null) {
             self.status = .ok;
         }
@@ -169,16 +176,30 @@ pub const Transaction = struct {
 
     /// Create a child span with the same trace_id and this transaction's span_id as parent.
     pub fn startChild(self: *Transaction, opts: ChildSpanOpts) !*Span {
+        return self.startChildWithDetails(opts, generateSpanId(), ts.now());
+    }
+
+    /// Create a child span with explicit span id and start timestamp.
+    pub fn startChildWithDetails(
+        self: *Transaction,
+        opts: ChildSpanOpts,
+        span_id: SpanId,
+        start_timestamp: f64,
+    ) !*Span {
+        if (self.spans.items.len >= MAX_SPANS) {
+            return error.MaxSpansExceeded;
+        }
+
         const span = try self.allocator.create(Span);
         errdefer self.allocator.destroy(span);
 
         span.* = Span{
             .trace_id = self.trace_id,
-            .span_id = generateSpanId(),
+            .span_id = span_id,
             .parent_span_id = self.span_id,
             .op = opts.op,
             .description = opts.description,
-            .start_timestamp = ts.now(),
+            .start_timestamp = start_timestamp,
         };
 
         try self.spans.append(self.allocator, span);
@@ -187,7 +208,12 @@ pub const Transaction = struct {
 
     /// Finish the transaction, setting timestamp and defaulting status to ok.
     pub fn finish(self: *Transaction) void {
-        self.timestamp = ts.now();
+        self.finishWithTimestamp(ts.now());
+    }
+
+    /// Finish the transaction with an explicit timestamp, defaulting status to ok.
+    pub fn finishWithTimestamp(self: *Transaction, timestamp: f64) void {
+        self.timestamp = timestamp;
         if (self.status == null) {
             self.status = .ok;
         }
@@ -361,6 +387,27 @@ test "Transaction.startChild creates span with matching trace_id and parent_span
     try testing.expect(!std.mem.eql(u8, &txn.span_id, &child.span_id));
 }
 
+test "Transaction.startChildWithDetails applies explicit id and timestamp" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /api",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const span_id: SpanId = "0123456789abcdef".*;
+    const start_timestamp = 1704067200.125;
+    const child = try txn.startChildWithDetails(
+        .{ .op = "db.query", .description = "SELECT * FROM users" },
+        span_id,
+        start_timestamp,
+    );
+
+    try testing.expectEqualSlices(u8, &span_id, &child.span_id);
+    try testing.expectEqual(start_timestamp, child.start_timestamp);
+    try testing.expect(child.parent_span_id != null);
+    try testing.expectEqualSlices(u8, &txn.span_id, &child.parent_span_id.?);
+}
+
 test "Transaction.init supports parent trace context" {
     const parent_trace_id: [32]u8 = "0123456789abcdef0123456789abcdef".*;
     const parent_span_id: SpanId = "89abcdef01234567".*;
@@ -412,6 +459,22 @@ test "Transaction.startChild keeps span pointers stable across growth" {
     try testing.expect(first.timestamp != null);
 }
 
+test "Transaction.startChild enforces MAX_SPANS limit" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /capped",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    var i: usize = 0;
+    while (i < MAX_SPANS) : (i += 1) {
+        _ = try txn.startChild(.{ .op = "next" });
+    }
+
+    try testing.expectError(error.MaxSpansExceeded, txn.startChild(.{ .op = "overflow" }));
+    try testing.expectEqual(MAX_SPANS, txn.spans.items.len);
+}
+
 test "Span.finish sets timestamp and status" {
     var span = Span{
         .trace_id = Uuid.v4().toHex(),
@@ -429,6 +492,20 @@ test "Span.finish sets timestamp and status" {
     try testing.expectEqual(SpanStatus.ok, span.status.?);
 }
 
+test "Span.finishWithTimestamp sets explicit timestamp and status" {
+    var span = Span{
+        .trace_id = Uuid.v4().toHex(),
+        .span_id = generateSpanId(),
+        .start_timestamp = ts.now(),
+    };
+
+    const explicit = 1704067201.250;
+    span.finishWithTimestamp(explicit);
+
+    try testing.expectEqual(explicit, span.timestamp.?);
+    try testing.expectEqual(SpanStatus.ok, span.status.?);
+}
+
 test "Transaction.finish sets timestamp" {
     var txn = Transaction.init(testing.allocator, .{
         .name = "POST /submit",
@@ -442,6 +519,20 @@ test "Transaction.finish sets timestamp" {
 
     try testing.expect(txn.timestamp != null);
     try testing.expect(txn.timestamp.? > 0);
+    try testing.expectEqual(SpanStatus.ok, txn.status.?);
+}
+
+test "Transaction.finishWithTimestamp sets explicit timestamp and status" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "POST /submit",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const explicit = 1704067202.375;
+    txn.finishWithTimestamp(explicit);
+
+    try testing.expectEqual(explicit, txn.timestamp.?);
     try testing.expectEqual(SpanStatus.ok, txn.status.?);
 }
 

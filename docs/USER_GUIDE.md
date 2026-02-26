@@ -243,6 +243,13 @@ var timed_txn = client.startTransactionWithTimestamp(.{
 }, 1704067200.125);
 defer timed_txn.deinit();
 
+const fixed_span = try timed_txn.startChildWithDetails(
+    .{ .op = "db.query", .description = "SELECT 1" },
+    "0123456789abcdef".*,
+    1704067200.250,
+);
+fixed_span.finishWithTimestamp(1704067200.500);
+
 const span = try txn.startChild(.{
     .op = "db.query",
     .description = "INSERT INTO orders",
@@ -251,6 +258,8 @@ span.finish();
 
 client.finishTransaction(&txn);
 ```
+
+The transaction span list is capped at `1000` child spans (`sentry.MAX_SPANS`).
 
 ### Sampling
 

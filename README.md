@@ -156,6 +156,13 @@ var timed_txn = client.startTransactionWithTimestamp(
     1704067200.125,
 );
 defer timed_txn.deinit();
+// Optional explicit child-span details
+const fixed_span = try timed_txn.startChildWithDetails(
+    .{ .op = "db.query", .description = "SELECT 1" },
+    "0123456789abcdef".*,
+    1704067200.250,
+);
+fixed_span.finishWithTimestamp(1704067200.500);
 // `sentry-sample_rate` from baggage is honored when transaction opts use default sample_rate.
 // Third-party baggage members are preserved when generating downstream baggage headers.
 
@@ -256,6 +263,8 @@ Run integration tests only:
 ```sh
 zig build test-integration
 ```
+
+Tracing note: each transaction stores up to `1000` child spans (`MAX_SPANS`).
 
 ## Roadmap Notes
 
