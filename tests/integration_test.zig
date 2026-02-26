@@ -710,6 +710,34 @@ test "CJM e2e: before_send_transaction can mutate transactions in place" {
     try testing.expect(relay.containsInAny("\"op\":\"http.server.processed\""));
 }
 
+test "CJM e2e: invalid explicit transaction sample_rate drops transaction" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "POST /invalid-rate",
+        .op = "http.server",
+        .sample_rate = 2.0,
+    });
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+
+    try testing.expectEqual(@as(usize, 0), relay.requestCount());
+}
+
 test "CJM e2e: session emits errored and exited updates" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();

@@ -580,7 +580,10 @@ pub const Client = struct {
                 break :blk self.options.traces_sample_rate;
             }
 
-            break :blk real_opts.sample_rate;
+            break :blk if (isValidSampleRate(real_opts.sample_rate))
+                real_opts.sample_rate
+            else
+                0.0;
         };
         real_opts.sample_rate = effective_sample_rate;
 
@@ -1885,6 +1888,33 @@ test "Client traces_sampler overrides traces_sample_rate" {
 
     try testing.expectEqual(@as(f64, 0.0), never_txn.sample_rate);
     try testing.expect(!never_txn.sampled);
+}
+
+test "Client startTransaction normalizes invalid explicit sample rates" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var too_high = client.startTransaction(.{
+        .name = "GET /invalid-rate-high",
+        .sample_rate = 1.5,
+    });
+    defer too_high.deinit();
+
+    try testing.expectEqual(@as(f64, 0.0), too_high.sample_rate);
+    try testing.expect(!too_high.sampled);
+
+    var too_low = client.startTransaction(.{
+        .name = "GET /invalid-rate-low",
+        .sample_rate = -0.1,
+    });
+    defer too_low.deinit();
+
+    try testing.expectEqual(@as(f64, 0.0), too_low.sample_rate);
+    try testing.expect(!too_low.sampled);
 }
 
 test "Client startTransactionFromSentryTrace continues upstream trace context" {
