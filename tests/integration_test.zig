@@ -608,6 +608,29 @@ test "CJM e2e: event with scope and attachment reaches relay" {
     try testing.expect(relay.containsInAny("sku=42"));
 }
 
+test "CJM e2e: explicit server_name is serialized into events" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .server_name = "checkout-node-1",
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.captureMessage("server-name-check", .info);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"event\""));
+    try testing.expect(relay.containsInAny("\"server_name\":\"checkout-node-1\""));
+}
+
 test "CJM e2e: transaction is sent when traces sample rate is enabled" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();

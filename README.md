@@ -209,6 +209,7 @@ All options are provided via `sentry.Options` in `sentry.init`.
 
 When `default_integrations = false`, automatic runtime/os context enrichment is disabled
 (trace context bootstrap remains enabled).
+When `server_name` is unset and `default_integrations = true`, the SDK attempts to use the local hostname.
 `in_app_include`/`in_app_exclude` are applied to exception stack frames.
 `accept_invalid_certs=true` is intended for local/dev environments and is not supported together with explicit proxy transport.
 

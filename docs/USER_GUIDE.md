@@ -463,6 +463,7 @@ By default, handlers are installed for:
 Configuration:
 - `install_signal_handlers = true|false`
 - `cache_dir` for crash marker files.
+- when `server_name` is unset and `default_integrations=true`, the SDK attempts to use local hostname.
 - `http_proxy` / `https_proxy` for explicit proxy URLs.
 - `accept_invalid_certs` to disable TLS certificate verification for direct HTTPS transport in local/dev setups.
 - `transport` for custom envelope sender callback.

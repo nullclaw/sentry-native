@@ -122,6 +122,7 @@ pub const Client = struct {
     scope: Scope,
     transport: Transport,
     worker: Worker,
+    default_server_name: ?[]u8 = null,
     session: ?Session = null,
     last_event_id: ?[32]u8 = null,
     mutex: std.Thread.Mutex = .{},
@@ -150,6 +151,12 @@ pub const Client = struct {
         var worker = try Worker.init(allocator, transportSendCallback, @ptrCast(self));
         errdefer worker.deinit();
 
+        var default_server_name: ?[]u8 = null;
+        errdefer if (default_server_name) |name| allocator.free(name);
+        if (options.default_integrations and options.server_name == null) {
+            default_server_name = detectServerNameAlloc(allocator);
+        }
+
         self.* = Client{
             .allocator = allocator,
             .dsn = dsn,
@@ -157,6 +164,7 @@ pub const Client = struct {
             .scope = scope,
             .transport = transport,
             .worker = worker,
+            .default_server_name = default_server_name,
             .session = null,
             .last_event_id = null,
         };
@@ -200,6 +208,7 @@ pub const Client = struct {
 
         self.transport.deinit();
         self.scope.deinit();
+        if (self.default_server_name) |name| self.allocator.free(name);
 
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -307,7 +316,7 @@ pub const Client = struct {
         if (self.options.environment) |env| {
             if (prepared_event_value.environment == null) prepared_event_value.environment = env;
         }
-        if (self.options.server_name) |sn| {
+        if (self.options.server_name orelse self.default_server_name) |sn| {
             if (prepared_event_value.server_name == null) prepared_event_value.server_name = sn;
         }
 
@@ -1151,6 +1160,14 @@ pub const Client = struct {
         return rate >= 0.0 and rate <= 1.0;
     }
 
+    fn detectServerNameAlloc(allocator: Allocator) ?[]u8 {
+        if (!builtin.link_libc and builtin.os.tag != .linux) return null;
+        var host_buffer: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        const host_name = std.posix.gethostname(&host_buffer) catch return null;
+        if (host_name.len == 0) return null;
+        return allocator.dupe(u8, host_name) catch null;
+    }
+
     fn submitEnvelope(self: *Client, data: []u8, category: RateLimitCategory) bool {
         if (self.options.max_request_body_size) |max_size| {
             if (data.len > max_size) {
@@ -1367,6 +1384,7 @@ var before_send_saw_runtime_context: bool = false;
 var before_send_saw_os_context: bool = false;
 var before_send_saw_threads: bool = false;
 var before_send_first_frame_in_app: ?bool = null;
+var before_send_observed_server_name: ?[]const u8 = null;
 
 fn inspectTraceContextBeforeSend(event: *Event) ?*Event {
     before_send_saw_trace_context = hasTraceContext(event);
@@ -1391,6 +1409,11 @@ fn inspectInAppBeforeSend(event: *Event) ?*Event {
             }
         }
     }
+    return event;
+}
+
+fn inspectServerNameBeforeSend(event: *Event) ?*Event {
+    before_send_observed_server_name = event.server_name;
     return event;
 }
 
@@ -1456,6 +1479,45 @@ test "Client default_integrations false injects trace context without runtime or
     try testing.expect(before_send_saw_trace_context);
     try testing.expect(!before_send_saw_runtime_context);
     try testing.expect(!before_send_saw_os_context);
+}
+
+test "Client fallback server_name is applied when option is unset" {
+    before_send_observed_server_name = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = false,
+        .before_send = inspectServerNameBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.default_server_name == null);
+    client.default_server_name = try testing.allocator.dupe(u8, "detected-host");
+
+    try testing.expect(client.captureMessageId("server-name-fallback", .info) != null);
+    try testing.expect(before_send_observed_server_name != null);
+    try testing.expectEqualStrings("detected-host", before_send_observed_server_name.?);
+}
+
+test "Client explicit server_name takes precedence over fallback server_name" {
+    before_send_observed_server_name = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .server_name = "explicit-host",
+        .default_integrations = false,
+        .before_send = inspectServerNameBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.default_server_name == null);
+    client.default_server_name = try testing.allocator.dupe(u8, "detected-host");
+
+    try testing.expect(client.captureMessageId("server-name-explicit", .info) != null);
+    try testing.expect(before_send_observed_server_name != null);
+    try testing.expectEqualStrings("explicit-host", before_send_observed_server_name.?);
 }
 
 test "Client in_app_include marks matching exception frames as in_app=true" {
