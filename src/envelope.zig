@@ -139,6 +139,17 @@ pub fn serializeSessionEnvelope(dsn: Dsn, session_json: []const u8, writer: *Wri
     try writer.writeAll(session_json);
 }
 
+/// Serialize a request-mode session aggregates envelope.
+pub fn serializeSessionAggregatesEnvelope(
+    dsn: Dsn,
+    session_aggregates_json: []const u8,
+    writer: *Writer,
+) !void {
+    try writeEnvelopeHeader(writer, dsn, null, null);
+    try writeItemHeader(writer, "sessions", session_aggregates_json.len);
+    try writer.writeAll(session_aggregates_json);
+}
+
 /// Serialize a monitor check-in envelope.
 pub fn serializeCheckInEnvelope(dsn: Dsn, check_in_json: []const u8, writer: *Writer) !void {
     try writeEnvelopeHeader(writer, dsn, null, null);
@@ -288,6 +299,28 @@ test "serializeSessionEnvelope produces valid format" {
 
     // Payload should match
     try testing.expectEqualStrings(session_json, line3);
+}
+
+test "serializeSessionAggregatesEnvelope produces valid format" {
+    const dsn = try Dsn.parse("https://key@sentry.example.com/42");
+    const session_aggregates_json =
+        \\{"aggregates":[{"started":"2025-01-01T00:00:00Z","exited":2}],"attrs":{"release":"checkout@1.2.3","environment":"production"}}
+    ;
+
+    var aw: Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+
+    try serializeSessionAggregatesEnvelope(dsn, session_aggregates_json, &aw.writer);
+    const output = aw.written();
+
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    const line1 = lines.next().?;
+    const line2 = lines.next().?;
+    const line3 = lines.rest();
+
+    try testing.expect(std.mem.indexOf(u8, line1, "\"dsn\"") != null);
+    try testing.expect(std.mem.indexOf(u8, line2, "\"type\":\"sessions\"") != null);
+    try testing.expectEqualStrings(session_aggregates_json, line3);
 }
 
 test "serializeEventEnvelopeWithAttachments includes attachment item headers and payloads" {

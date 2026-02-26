@@ -1189,7 +1189,7 @@ test "CJM e2e: session emits errored and exited updates" {
     try testing.expect(relay.containsInAny("\"payment declined\""));
 }
 
-test "CJM e2e: request session mode omits duration field" {
+test "CJM e2e: request session mode sends aggregated sessions payload" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();
     try relay.start();
@@ -1212,8 +1212,9 @@ test "CJM e2e: request session mode omits duration field" {
     try testing.expect(client.flush(2000));
     try testing.expect(relay.waitForAtLeast(1, 2000));
 
-    try testing.expect(relay.containsInAny("\"type\":\"session\""));
-    try testing.expect(relay.containsInAny("\"status\":\"exited\""));
+    try testing.expect(relay.containsInAny("\"type\":\"sessions\""));
+    try testing.expect(relay.containsInAny("\"aggregates\""));
+    try testing.expect(relay.containsInAny("\"exited\":1"));
     try testing.expect(!relay.containsInAny("\"duration\""));
 }
 

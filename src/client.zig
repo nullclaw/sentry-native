@@ -41,6 +41,7 @@ const propagation = @import("propagation.zig");
 const DynamicSamplingContext = propagation.DynamicSamplingContext;
 const PropagationHeader = propagation.PropagationHeader;
 const Uuid = @import("uuid.zig").Uuid;
+const ts = @import("timestamp.zig");
 
 const ExceptionFrameOwnership = struct {
     allocator: Allocator,
@@ -56,6 +57,17 @@ const ExceptionFrameOwnership = struct {
         self.* = undefined;
     }
 };
+
+const SessionAggregateBucket = struct {
+    started_minute_unix: i64,
+    did: ?[]u8 = null,
+    exited: u32 = 0,
+    errored: u32 = 0,
+    abnormal: u32 = 0,
+    crashed: u32 = 0,
+};
+
+const MAX_SESSION_AGGREGATE_BUCKETS: usize = 100;
 
 pub const SessionMode = enum {
     application,
@@ -136,6 +148,7 @@ pub const Client = struct {
     default_server_name: ?[]u8 = null,
     session_did: ?[]u8 = null,
     session: ?Session = null,
+    session_aggregates: std.ArrayListUnmanaged(SessionAggregateBucket) = .{},
     last_event_id: ?[32]u8 = null,
     mutex: std.Thread.Mutex = .{},
     log_batch_mutex: std.Thread.Mutex = .{},
@@ -231,6 +244,7 @@ pub const Client = struct {
         self.scope.deinit();
         if (self.default_server_name) |name| self.allocator.free(name);
         if (self.session_did) |did| self.allocator.free(did);
+        self.deinitSessionAggregates();
 
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -455,7 +469,7 @@ pub const Client = struct {
                         s.markErrored();
                     }
                 }
-                if (s.dirty) {
+                if (self.options.session_mode == .application and s.dirty) {
                     _ = self.sendSessionUpdate(s);
                 }
             }
@@ -575,13 +589,21 @@ pub const Client = struct {
         try self.scope.setContext(key, value);
     }
 
-    /// Add a breadcrumb.
-    pub fn addBreadcrumb(self: *Client, crumb: Breadcrumb) void {
-        self.tryAddBreadcrumb(crumb) catch {};
+    /// Add breadcrumbs from a supported input form:
+    /// - Breadcrumb
+    /// - ?Breadcrumb
+    /// - []const Breadcrumb / [N]Breadcrumb
+    /// - fn() returning any supported form
+    pub fn addBreadcrumb(self: *Client, crumbs: anytype) void {
+        self.tryAddBreadcrumb(crumbs) catch {};
     }
 
-    /// Add a breadcrumb and surface allocation failures.
-    pub fn tryAddBreadcrumb(self: *Client, crumb: Breadcrumb) !void {
+    /// Fallible variant of addBreadcrumb.
+    pub fn tryAddBreadcrumb(self: *Client, crumbs: anytype) !void {
+        try self.tryAddBreadcrumbInput(crumbs);
+    }
+
+    fn tryAddSingleBreadcrumb(self: *Client, crumb: Breadcrumb) !void {
         if (self.options.before_breadcrumb) |before_breadcrumb| {
             if (before_breadcrumb(crumb)) |processed| {
                 try self.scope.tryAddBreadcrumb(processed);
@@ -589,6 +611,82 @@ pub const Client = struct {
             return;
         }
         try self.scope.tryAddBreadcrumb(crumb);
+    }
+
+    fn breadcrumbFromStruct(value: anytype) Breadcrumb {
+        const T = @TypeOf(value);
+        const struct_info = switch (@typeInfo(T)) {
+            .@"struct" => |info| info,
+            else => @compileError("Breadcrumb struct conversion requires a struct input."),
+        };
+
+        var crumb = Breadcrumb{};
+        inline for (struct_info.fields) |field| {
+            if (!@hasField(Breadcrumb, field.name)) {
+                @compileError("Unsupported breadcrumb field.");
+            }
+            @field(crumb, field.name) = @field(value, field.name);
+        }
+        return crumb;
+    }
+
+    fn tryAddBreadcrumbInput(self: *Client, crumbs: anytype) !void {
+        const T = @TypeOf(crumbs);
+        switch (@typeInfo(T)) {
+            .optional => {
+                if (crumbs) |crumb| {
+                    try self.tryAddBreadcrumbInput(crumb);
+                }
+                return;
+            },
+            .@"struct" => {
+                const crumb = breadcrumbFromStruct(crumbs);
+                try self.tryAddSingleBreadcrumb(crumb);
+                return;
+            },
+            .array => {
+                for (crumbs) |crumb| {
+                    try self.tryAddBreadcrumbInput(crumb);
+                }
+                return;
+            },
+            .pointer => |ptr| {
+                if (ptr.size == .slice) {
+                    for (crumbs) |crumb| {
+                        try self.tryAddBreadcrumbInput(crumb);
+                    }
+                    return;
+                }
+                if (ptr.size == .one) {
+                    switch (@typeInfo(ptr.child)) {
+                        .@"fn" => {
+                            const produced = crumbs();
+                            try self.tryAddBreadcrumbInput(produced);
+                            return;
+                        },
+                        .array => {
+                            for (crumbs.*) |crumb| {
+                                try self.tryAddBreadcrumbInput(crumb);
+                            }
+                            return;
+                        },
+                        else => {
+                            const crumb = breadcrumbFromStruct(crumbs.*);
+                            try self.tryAddSingleBreadcrumb(crumb);
+                            return;
+                        },
+                    }
+                }
+            },
+            .@"fn" => {
+                const produced = crumbs();
+                try self.tryAddBreadcrumbInput(produced);
+                return;
+            },
+            else => {},
+        }
+
+        @compileError("Unsupported breadcrumb input type.");
     }
 
     /// Clear all breadcrumbs from the scope.
@@ -922,7 +1020,14 @@ pub const Client = struct {
         // End any existing session first
         if (self.session) |*s| {
             s.end(.exited);
-            _ = self.sendSessionUpdate(s);
+            if (self.options.session_mode == .request) {
+                _ = self.enqueueSessionAggregate(s);
+                if (self.session_aggregates.items.len >= MAX_SESSION_AGGREGATE_BUCKETS) {
+                    _ = self.flushSessionAggregatesLocked();
+                }
+            } else {
+                _ = self.sendSessionUpdate(s);
+            }
             self.session = null;
         }
         if (self.session_did) |did| {
@@ -949,7 +1054,14 @@ pub const Client = struct {
 
         if (self.session) |*s| {
             s.end(status);
-            _ = self.sendSessionUpdate(s);
+            if (self.options.session_mode == .request) {
+                _ = self.enqueueSessionAggregate(s);
+                if (self.session_aggregates.items.len >= MAX_SESSION_AGGREGATE_BUCKETS) {
+                    _ = self.flushSessionAggregatesLocked();
+                }
+            } else {
+                _ = self.sendSessionUpdate(s);
+            }
             self.session = null;
         }
         if (self.session_did) |did| {
@@ -969,6 +1081,7 @@ pub const Client = struct {
     /// Returns true when the queue was drained before shutdown.
     pub fn close(self: *Client, timeout_ms: ?u64) bool {
         self.endSession(.exited);
+        self.flushPendingSessionAggregates();
         self.shutdownLogBatcher();
         self.flushPendingLogBatch();
         const drained = self.worker.flush(timeout_ms orelse self.options.shutdown_timeout_ms);
@@ -986,6 +1099,7 @@ pub const Client = struct {
     /// Flush the event queue, waiting up to timeout_ms.
     /// Returns true if the queue was fully drained.
     pub fn flush(self: *Client, timeout_ms: u64) bool {
+        self.flushPendingSessionAggregates();
         self.flushPendingLogBatch();
         return self.worker.flush(timeout_ms);
     }
@@ -1620,6 +1734,144 @@ pub const Client = struct {
         return true;
     }
 
+    fn enqueueSessionAggregate(self: *Client, session: *Session) bool {
+        self.ensureSessionDistinctId(session);
+
+        const started_minute_unix = startedMinuteUnix(session.started);
+
+        var target_bucket: ?*SessionAggregateBucket = null;
+        for (self.session_aggregates.items) |*bucket| {
+            if (bucket.started_minute_unix != started_minute_unix) continue;
+            if (!equalSessionDistinctId(bucket.did, session.did)) continue;
+            target_bucket = bucket;
+            break;
+        }
+
+        if (target_bucket == null) {
+            var did_copy: ?[]u8 = null;
+            if (session.did) |did| {
+                did_copy = self.allocator.dupe(u8, did) catch return false;
+            }
+
+            self.session_aggregates.append(self.allocator, .{
+                .started_minute_unix = started_minute_unix,
+                .did = did_copy,
+            }) catch {
+                if (did_copy) |did| self.allocator.free(did);
+                return false;
+            };
+            target_bucket = &self.session_aggregates.items[self.session_aggregates.items.len - 1];
+        }
+
+        const bucket = target_bucket.?;
+        switch (session.status) {
+            .crashed => bucket.crashed += 1,
+            .abnormal => bucket.abnormal += 1,
+            .errored => bucket.errored += 1,
+            .ok, .exited => {
+                if (session.errors > 0) {
+                    bucket.errored += 1;
+                } else {
+                    bucket.exited += 1;
+                }
+            },
+        }
+
+        session.markSent();
+        return true;
+    }
+
+    fn flushPendingSessionAggregates(self: *Client) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.flushSessionAggregatesLocked();
+    }
+
+    fn flushSessionAggregatesLocked(self: *Client) bool {
+        if (self.options.session_mode != .request) return true;
+        if (self.session_aggregates.items.len == 0) return true;
+
+        const release = self.options.release orelse return false;
+        const environment = self.options.environment orelse "production";
+
+        var payload_writer: Writer.Allocating = .init(self.allocator);
+        defer payload_writer.deinit();
+
+        const writer = &payload_writer.writer;
+        writer.writeAll("{\"aggregates\":[") catch return false;
+
+        for (self.session_aggregates.items, 0..) |bucket, index| {
+            if (index > 0) writer.writeByte(',') catch return false;
+
+            writer.writeByte('{') catch return false;
+            writer.writeAll("\"started\":\"") catch return false;
+            const started_ms: u64 = @intCast(bucket.started_minute_unix * 1000);
+            const started_rfc = ts.formatRfc3339(started_ms);
+            writer.writeAll(&started_rfc) catch return false;
+            writer.writeByte('"') catch return false;
+
+            if (bucket.did) |did| {
+                writer.writeAll(",\"did\":") catch return false;
+                json.Stringify.value(did, .{}, writer) catch return false;
+            }
+            if (bucket.exited > 0) writer.print(",\"exited\":{d}", .{bucket.exited}) catch return false;
+            if (bucket.errored > 0) writer.print(",\"errored\":{d}", .{bucket.errored}) catch return false;
+            if (bucket.abnormal > 0) writer.print(",\"abnormal\":{d}", .{bucket.abnormal}) catch return false;
+            if (bucket.crashed > 0) writer.print(",\"crashed\":{d}", .{bucket.crashed}) catch return false;
+
+            writer.writeByte('}') catch return false;
+        }
+
+        writer.writeAll("],\"attrs\":{\"release\":") catch return false;
+        json.Stringify.value(release, .{}, writer) catch return false;
+        writer.writeAll(",\"environment\":") catch return false;
+        json.Stringify.value(environment, .{}, writer) catch return false;
+        writer.writeAll("}}") catch return false;
+
+        const aggregates_json = payload_writer.toOwnedSlice() catch return false;
+        defer self.allocator.free(aggregates_json);
+
+        var envelope_writer: Writer.Allocating = .init(self.allocator);
+        envelope.serializeSessionAggregatesEnvelope(self.dsn, aggregates_json, &envelope_writer.writer) catch {
+            envelope_writer.deinit();
+            return false;
+        };
+        const envelope_data = envelope_writer.toOwnedSlice() catch {
+            envelope_writer.deinit();
+            return false;
+        };
+
+        if (!self.submitEnvelope(envelope_data, .session)) {
+            return false;
+        }
+
+        self.clearSessionAggregatesLocked();
+        return true;
+    }
+
+    fn clearSessionAggregatesLocked(self: *Client) void {
+        for (self.session_aggregates.items) |bucket| {
+            if (bucket.did) |did| self.allocator.free(did);
+        }
+        self.session_aggregates.clearRetainingCapacity();
+    }
+
+    fn deinitSessionAggregates(self: *Client) void {
+        self.clearSessionAggregatesLocked();
+        self.session_aggregates.deinit(self.allocator);
+    }
+
+    fn equalSessionDistinctId(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null and b == null) return true;
+        if (a == null or b == null) return false;
+        return std.mem.eql(u8, a.?, b.?);
+    }
+
+    fn startedMinuteUnix(started: f64) i64 {
+        const started_unix: i64 = @intFromFloat(started);
+        return @divFloor(started_unix, 60) * 60;
+    }
+
     fn isValidSampleRate(rate: f64) bool {
         if (!std.math.isFinite(rate)) return false;
         return rate >= 0.0 and rate <= 1.0;
@@ -1848,6 +2100,23 @@ fn rewriteBreadcrumb(crumb: Breadcrumb) ?Breadcrumb {
     var updated = crumb;
     updated.message = "Testing aha!";
     return updated;
+}
+
+fn breadcrumbFactoryFirst() Breadcrumb {
+    return .{ .message = "First breadcrumb", .category = "log" };
+}
+
+const generated_breadcrumb_batch = [_]Breadcrumb{
+    .{ .message = "Third breadcrumb", .category = "log" },
+    .{ .message = "Fourth breadcrumb", .category = "log" },
+};
+
+fn breadcrumbFactoryBatch() []const Breadcrumb {
+    return generated_breadcrumb_batch[0..];
+}
+
+fn breadcrumbFactoryNone() ?Breadcrumb {
+    return null;
 }
 
 var replacement_event_for_test: Event = undefined;
@@ -2330,6 +2599,28 @@ test "Client breadcrumbs preserve order after clearing older entries" {
     client.addBreadcrumb(.{ .message = "Fourth breadcrumb", .category = "log" });
 
     try testing.expect(client.captureMessageId("breadcrumb-order", .warning) != null);
+    try testing.expect(before_send_breadcrumbs_match);
+}
+
+test "Client addBreadcrumb accepts optional slice and factory inputs" {
+    before_send_breadcrumbs_match = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send = inspectBreadcrumbOrderBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.addBreadcrumb(.{ .message = "Old breadcrumb to be removed", .category = "log" });
+    client.clearBreadcrumbs();
+    client.addBreadcrumb(breadcrumbFactoryFirst);
+    client.addBreadcrumb(.{ .message = "Second breadcrumb", .category = "log" });
+    client.addBreadcrumb(breadcrumbFactoryBatch);
+    client.addBreadcrumb(breadcrumbFactoryNone);
+    client.addBreadcrumb(@as(?Breadcrumb, null));
+
+    try testing.expect(client.captureMessageId("breadcrumb-input-types", .warning) != null);
     try testing.expect(before_send_breadcrumbs_match);
 }
 
@@ -3941,7 +4232,7 @@ test "Client request session mode disables duration tracking" {
     try testing.expect(!client.session.?.track_duration);
 }
 
-test "Client request session mode serializes session updates without duration" {
+test "Client request session mode serializes aggregated sessions envelope" {
     var state = PayloadTransportState.init(testing.allocator);
     defer state.deinit();
 
@@ -3963,9 +4254,56 @@ test "Client request session mode serializes session updates without duration" {
 
     try testing.expectEqual(@as(usize, 1), state.sent_count);
     try testing.expect(state.last_payload != null);
-    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"type\":\"session\"") != null);
-    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"status\":\"exited\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"type\":\"sessions\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"aggregates\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"exited\":1") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"duration\"") == null);
+}
+
+test "Client request session mode aggregates counts by distinct id" {
+    var state = MultiPayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
+        .session_mode = .request,
+        .transport = .{
+            .send_fn = multiPayloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.startSession();
+    client.endSession(.exited);
+    client.startSession();
+    client.endSession(.exited);
+
+    client.setUser(.{ .id = "user-42" });
+    client.startSession();
+    client.captureException("CheckoutError", "payment declined");
+    client.endSession(.exited);
+
+    _ = client.flush(1000);
+
+    var saw_event = false;
+    var sessions_payload: ?[]const u8 = null;
+    for (state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"event\"") != null) {
+            saw_event = true;
+        }
+        if (sessions_payload == null and std.mem.indexOf(u8, payload, "\"type\":\"sessions\"") != null) {
+            sessions_payload = payload;
+        }
+    }
+
+    try testing.expect(saw_event);
+    try testing.expect(sessions_payload != null);
+    try testing.expect(std.mem.indexOf(u8, sessions_payload.?, "\"exited\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, sessions_payload.?, "\"errored\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, sessions_payload.?, "\"did\":\"user-42\"") != null);
 }
 
 test "Client session distinct id uses scope user id" {

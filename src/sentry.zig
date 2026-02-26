@@ -204,9 +204,9 @@ pub fn lastEventId() ?[32]u8 {
     return hub.lastEventId();
 }
 
-pub fn addBreadcrumb(crumb: Breadcrumb) void {
+pub fn addBreadcrumb(crumbs: anytype) void {
     if (Hub.current()) |hub| {
-        hub.addBreadcrumb(crumb);
+        hub.addBreadcrumb(crumbs);
     }
 }
 
@@ -292,6 +292,16 @@ fn observeConfiguredScopeTag(hub: *Hub) void {
 var global_integration_lookup_called: bool = false;
 var global_integration_lookup_received_null: bool = false;
 var global_integration_lookup_flag_value: ?bool = null;
+var global_breadcrumb_factory_calls: usize = 0;
+
+fn globalBreadcrumbFactory() Breadcrumb {
+    global_breadcrumb_factory_calls += 1;
+    return .{
+        .category = "global",
+        .message = "factory-breadcrumb",
+        .level = .info,
+    };
+}
 
 fn testGlobalIntegrationSetup(_: *Client, ctx: ?*anyopaque) void {
     if (ctx) |ptr| {
@@ -315,6 +325,7 @@ test "global wrappers are safe no-op without current hub" {
     global_integration_lookup_called = false;
     global_integration_lookup_received_null = false;
     global_integration_lookup_flag_value = null;
+    global_breadcrumb_factory_calls = 0;
 
     try std.testing.expect(currentHub() == null);
     try std.testing.expect(captureMessage("no-hub", .info) == null);
@@ -353,6 +364,8 @@ test "global wrappers are safe no-op without current hub" {
     try std.testing.expect(lastEventId() == null);
 
     addBreadcrumb(.{ .message = "no-hub" });
+    addBreadcrumb(globalBreadcrumbFactory);
+    try std.testing.expectEqual(@as(usize, 0), global_breadcrumb_factory_calls);
     clearBreadcrumbs();
     try std.testing.expect(!withScope(withScopeSetTag));
     with_configured_scope_seen_match = false;
@@ -380,9 +393,12 @@ test "global wrappers route through current hub" {
 
     _ = setCurrentHub(&hub);
     try std.testing.expect(currentHub().? == &hub);
+    global_breadcrumb_factory_calls = 0;
 
     addBreadcrumb(.{ .message = "global-crumb" });
-    try std.testing.expectEqual(@as(usize, 1), hub.currentScope().breadcrumbs.count);
+    addBreadcrumb(globalBreadcrumbFactory);
+    try std.testing.expectEqual(@as(usize, 1), global_breadcrumb_factory_calls);
+    try std.testing.expectEqual(@as(usize, 2), hub.currentScope().breadcrumbs.count);
 
     try std.testing.expect(pushScope());
     hub.setTag("scope", "inner");

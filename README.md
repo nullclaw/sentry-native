@@ -95,7 +95,7 @@ exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 | Transaction DSC envelope header | Implemented | Envelope header includes `trace_id/public_key/sample_rate/sampled` |
 | Trace propagation headers | Implemented | `sentry-trace`/`baggage` generation + continuation from trace value, header pairs, or explicit propagation headers |
 | Traces sampler callback | Implemented | `traces_sampler` has priority over `traces_sample_rate` |
-| Sessions (application/request mode) | Implemented | Request mode disables duration tracking; payloads include session sequence (`seq`) |
+| Sessions (application/request mode) | Implemented | Request mode disables duration tracking and emits aggregated `sessions` envelopes |
 | Session distinct id (`did`) | Implemented | Derived from `Scope.user` (`id`/`email`/`username`) when available |
 | Monitor check-ins | Implemented | `check_in` envelopes with env inheritance |
 | Worker + queue draining | Implemented | Bounded queue + `flush`/`close` semantics |

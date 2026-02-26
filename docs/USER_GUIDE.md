@@ -447,7 +447,8 @@ client.endSession(.exited);
 If `Scope.user` is set before `startSession`, session `did` is derived from user context
 in priority order: `id`, then `email`, then `username`.
 If user context is set after `startSession`, `did` is attached on the next session update.
-Session payloads include `seq` (monotonic sequence) for release health updates.
+In `.application` mode, individual `session` updates include `seq` (monotonic sequence).
+In `.request` mode, updates are aggregated into `sessions` envelopes.
 
 ### Auto mode
 
@@ -462,7 +463,7 @@ const client = try sentry.init(allocator, .{
 Important:
 - Without `release`, sessions do not start.
 - `.application` mode tracks duration.
-- `.request` mode does not send duration.
+- `.request` mode does not send duration and reports aggregated counts.
 
 ## Monitor Check-Ins
 
