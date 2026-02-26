@@ -362,6 +362,15 @@ pub const Client = struct {
                 prepared_event.contexts = value;
                 owned_trace_contexts = value;
             }
+        } else {
+            if (mergeDefaultTraceContexts(
+                self.allocator,
+                prepared_event,
+                self.options.default_integrations,
+            ) catch null) |value| {
+                prepared_event.contexts = value;
+                owned_trace_contexts = value;
+            }
         }
 
         var owned_threads: ?json.Value = null;
@@ -1069,6 +1078,59 @@ pub const Client = struct {
         return .{ .object = threads_object };
     }
 
+    fn mergeDefaultTraceContexts(
+        allocator: Allocator,
+        event: *Event,
+        include_runtime_os: bool,
+    ) !?json.Value {
+        const contexts = event.contexts orelse return null;
+        if (contexts != .object) return null;
+
+        const existing = contexts.object;
+        const need_trace = existing.get("trace") == null;
+        const need_runtime = include_runtime_os and existing.get("runtime") == null;
+        const need_os = include_runtime_os and existing.get("os") == null;
+        if (!need_trace and !need_runtime and !need_os) return null;
+
+        var merged = try scope_mod.cloneJsonValue(allocator, contexts);
+        errdefer scope_mod.deinitJsonValueDeep(allocator, &merged);
+        if (merged != .object) return null;
+
+        const defaults = try buildDefaultTraceContexts(allocator, include_runtime_os);
+        defer {
+            var defaults_owned = defaults;
+            scope_mod.deinitJsonValueDeep(allocator, &defaults_owned);
+        }
+        if (defaults != .object) return null;
+
+        const merged_object = &merged.object;
+        const default_object = defaults.object;
+
+        if (need_trace) {
+            if (default_object.get("trace")) |trace_value| {
+                var trace_copy = try scope_mod.cloneJsonValue(allocator, trace_value);
+                errdefer scope_mod.deinitJsonValueDeep(allocator, &trace_copy);
+                try putOwnedJsonEntry(allocator, merged_object, "trace", trace_copy);
+            }
+        }
+        if (need_runtime) {
+            if (default_object.get("runtime")) |runtime_value| {
+                var runtime_copy = try scope_mod.cloneJsonValue(allocator, runtime_value);
+                errdefer scope_mod.deinitJsonValueDeep(allocator, &runtime_copy);
+                try putOwnedJsonEntry(allocator, merged_object, "runtime", runtime_copy);
+            }
+        }
+        if (need_os) {
+            if (default_object.get("os")) |os_value| {
+                var os_copy = try scope_mod.cloneJsonValue(allocator, os_value);
+                errdefer scope_mod.deinitJsonValueDeep(allocator, &os_copy);
+                try putOwnedJsonEntry(allocator, merged_object, "os", os_copy);
+            }
+        }
+
+        return merged;
+    }
+
     fn transportSendCallback(data: []const u8, ctx: ?*anyopaque) SendOutcome {
         if (ctx) |ptr| {
             const client: *Client = @ptrCast(@alignCast(ptr));
@@ -1526,6 +1588,39 @@ test "Client default_integrations false injects trace context without runtime or
     try testing.expect(before_send_saw_trace_context);
     try testing.expect(!before_send_saw_runtime_context);
     try testing.expect(!before_send_saw_os_context);
+}
+
+test "Client merges default trace contexts into existing custom event contexts" {
+    before_send_saw_trace_context = false;
+    before_send_saw_runtime_context = false;
+    before_send_saw_os_context = false;
+
+    var contexts_object = json.ObjectMap.init(testing.allocator);
+    defer {
+        var contexts_value: json.Value = .{ .object = contexts_object };
+        scope_mod.deinitJsonValueDeep(testing.allocator, &contexts_value);
+    }
+    const custom_key = try testing.allocator.dupe(u8, "custom");
+    const custom_value = try testing.allocator.dupe(u8, "value");
+    try contexts_object.put(custom_key, .{ .string = custom_value });
+
+    var event = Event.initMessage("custom-contexts", .info);
+    event.contexts = .{ .object = contexts_object };
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send = inspectTraceContextBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expect(before_send_saw_trace_context);
+    try testing.expect(before_send_saw_runtime_context);
+    try testing.expect(before_send_saw_os_context);
+    try testing.expect(contexts_object.get("trace") == null);
+    try testing.expect(contexts_object.get("runtime") == null);
+    try testing.expect(contexts_object.get("os") == null);
 }
 
 test "Client fallback server_name is applied when option is unset" {

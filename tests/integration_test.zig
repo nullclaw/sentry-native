@@ -1133,6 +1133,49 @@ test "CJM e2e: default_integrations false omits runtime and os contexts" {
     try testing.expect(!relay.containsInAny("\"os\":"));
 }
 
+test "CJM e2e: custom event contexts still receive default trace context" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var contexts = std.json.ObjectMap.init(testing.allocator);
+    defer {
+        var it = contexts.iterator();
+        while (it.next()) |entry| {
+            testing.allocator.free(@constCast(entry.key_ptr.*));
+            switch (entry.value_ptr.*) {
+                .string => |s| testing.allocator.free(@constCast(s)),
+                .number_string => |s| testing.allocator.free(@constCast(s)),
+                else => {},
+            }
+        }
+        contexts.deinit();
+    }
+    const key = try testing.allocator.dupe(u8, "custom");
+    const val = try testing.allocator.dupe(u8, "value");
+    try contexts.put(key, .{ .string = val });
+
+    var event = sentry.Event.initMessage("custom-context-event", .info);
+    event.contexts = .{ .object = contexts };
+    _ = client.captureEventId(&event);
+
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"event\""));
+    try testing.expect(relay.containsInAny("\"custom\":\"value\""));
+    try testing.expect(relay.containsInAny("\"trace\":{"));
+}
+
 test "CJM e2e: in_app_include marks matching exception frames" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();

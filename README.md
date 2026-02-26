@@ -91,7 +91,7 @@ exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 | Scope enrichment | Implemented | User/tags/extras/contexts/breadcrumbs/fingerprint/transaction |
 | Attachments | Implemented | In-memory and file-backed attachments |
 | Transactions & spans | Implemented | Sampling + trace context serialization |
-| Event context bootstrap | Implemented | Captured events receive default `contexts.trace` + runtime/os contexts when absent |
+| Event context bootstrap | Implemented | Captured events receive missing `contexts.trace` + runtime/os entries while preserving custom contexts |
 | Transaction DSC envelope header | Implemented | Envelope header includes `trace_id/public_key/sample_rate/sampled` |
 | Trace propagation headers | Implemented | `sentry-trace`/`baggage` generation + incoming `sentry-trace` continuation |
 | Traces sampler callback | Implemented | `traces_sampler` has priority over `traces_sample_rate` |

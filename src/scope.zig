@@ -129,7 +129,7 @@ fn upsertOwnedObjectEntry(allocator: Allocator, obj: *json.ObjectMap, key: []con
     try obj.put(key_copy, value);
 }
 
-fn cloneJsonValue(allocator: Allocator, value: json.Value) !json.Value {
+pub fn cloneJsonValue(allocator: Allocator, value: json.Value) !json.Value {
     return switch (value) {
         .null => .null,
         .bool => |v| .{ .bool = v },
