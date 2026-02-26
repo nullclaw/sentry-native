@@ -150,6 +150,7 @@ var txn2 = try client.startTransactionFromPropagationHeaders(
 );
 defer txn2.deinit();
 // `sentry-sample_rate` from baggage is honored when transaction opts use default sample_rate.
+// Third-party baggage members are preserved when generating downstream baggage headers.
 
 // Parse incoming baggage directly (borrowed or decoded/owned variants)
 const parsed_baggage = sentry.parseBaggage(incoming_baggage);

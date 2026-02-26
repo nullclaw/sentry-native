@@ -3,6 +3,9 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const Writer = std.io.Writer;
 
+const max_baggage_members = 64;
+const max_baggage_size = 8192;
+
 pub const SentryTrace = struct {
     trace_id: [32]u8,
     span_id: [16]u8,
@@ -115,6 +118,58 @@ pub fn formatBaggageAlloc(allocator: Allocator, dsc: DynamicSamplingContext) ![]
     return try aw.toOwnedSlice();
 }
 
+/// Merge incoming baggage with fresh Sentry DSC fields.
+/// Existing `sentry-*` keys are replaced while third-party entries are preserved.
+pub fn mergeBaggageAlloc(
+    allocator: Allocator,
+    incoming_baggage: ?[]const u8,
+    dsc: DynamicSamplingContext,
+) ![]u8 {
+    const sentry_baggage = try formatBaggageAlloc(allocator, dsc);
+    errdefer allocator.free(sentry_baggage);
+
+    const incoming = incoming_baggage orelse return sentry_baggage;
+    if (std.mem.trim(u8, incoming, " \t").len == 0) return sentry_baggage;
+
+    const sentry_member_count = countBaggageMembers(sentry_baggage);
+    const max_preserved_members: usize = if (sentry_member_count >= max_baggage_members)
+        0
+    else
+        max_baggage_members - sentry_member_count;
+
+    var aw: Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+
+    var kept_members: usize = 0;
+    var kept_len: usize = 0;
+    var members = std.mem.splitScalar(u8, incoming, ',');
+    while (members.next()) |member_raw| {
+        const member = std.mem.trim(u8, member_raw, " \t");
+        if (member.len == 0 or isSentryBaggageMember(member)) continue;
+        if (kept_members >= max_preserved_members) continue;
+
+        const kept_sep_len: usize = if (kept_members > 0) 1 else 0;
+        const new_kept_len = kept_len + kept_sep_len + member.len;
+        const sentry_sep_len: usize = if (new_kept_len > 0) 1 else 0;
+        if (new_kept_len + sentry_sep_len + sentry_baggage.len > max_baggage_size) continue;
+
+        if (kept_members > 0) {
+            try w.writeByte(',');
+        }
+        try w.writeAll(member);
+        kept_members += 1;
+        kept_len = new_kept_len;
+    }
+
+    if (kept_members > 0) {
+        try w.writeByte(',');
+    }
+    try w.writeAll(sentry_baggage);
+    allocator.free(sentry_baggage);
+    return try aw.toOwnedSlice();
+}
+
 pub fn parseBaggage(header_value: []const u8) ParsedBaggage {
     var parsed: ParsedBaggage = .{};
     var fields = std.mem.splitScalar(u8, header_value, ',');
@@ -202,6 +257,27 @@ fn decodePercentValueAlloc(allocator: Allocator, value: []const u8) ![]u8 {
     const copy = try allocator.alloc(u8, decoded.len);
     @memcpy(copy, decoded);
     return copy;
+}
+
+fn isSentryBaggageMember(member: []const u8) bool {
+    const eq_index = std.mem.indexOfScalar(u8, member, '=');
+    const key = std.mem.trim(
+        u8,
+        if (eq_index) |idx| member[0..idx] else member,
+        " \t",
+    );
+    return key.len >= "sentry-".len and std.ascii.eqlIgnoreCase(key[0.."sentry-".len], "sentry-");
+}
+
+fn countBaggageMembers(header_value: []const u8) usize {
+    var count: usize = 0;
+    var members = std.mem.splitScalar(u8, header_value, ',');
+    while (members.next()) |member_raw| {
+        const member = std.mem.trim(u8, member_raw, " \t");
+        if (member.len == 0) continue;
+        count += 1;
+    }
+    return count;
 }
 
 fn isHex(value: []const u8, expected_len: usize) bool {
@@ -313,4 +389,88 @@ test "parseBaggageAlloc decodes percent-encoded values" {
     try testing.expectEqualStrings("app@1.2.3", parsed.release.?);
     try testing.expectEqualStrings("prod", parsed.environment.?);
     try testing.expectEqualStrings("POST /checkout", parsed.transaction.?);
+}
+
+test "mergeBaggageAlloc preserves third-party entries and refreshes sentry keys" {
+    const dsc: DynamicSamplingContext = .{
+        .trace_id = "fedcba9876543210fedcba9876543210".*,
+        .public_key = "new-key",
+        .release = "app@2.0.0",
+        .sampled = true,
+    };
+
+    const merged = try mergeBaggageAlloc(
+        testing.allocator,
+        "vendor=1, foo=bar ,sentry-trace_id=oldtrace,sentry-public_key=old,sentry-sampled=false",
+        dsc,
+    );
+    defer testing.allocator.free(merged);
+
+    try testing.expect(std.mem.indexOf(u8, merged, "vendor=1") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "foo=bar") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "sentry-trace_id=fedcba9876543210fedcba9876543210") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "sentry-public_key=new-key") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "sentry-release=app%402.0.0") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "sentry-sampled=true") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "oldtrace") == null);
+}
+
+test "mergeBaggageAlloc falls back to sentry-only baggage when incoming is empty" {
+    const dsc: DynamicSamplingContext = .{
+        .trace_id = "fedcba9876543210fedcba9876543210".*,
+        .public_key = "pk",
+    };
+
+    const merged = try mergeBaggageAlloc(testing.allocator, "   ", dsc);
+    defer testing.allocator.free(merged);
+
+    try testing.expect(std.mem.indexOf(u8, merged, "sentry-trace_id=fedcba9876543210fedcba9876543210") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "sentry-public_key=pk") != null);
+}
+
+test "mergeBaggageAlloc caps total baggage members" {
+    var incoming_builder: Writer.Allocating = .init(testing.allocator);
+    defer incoming_builder.deinit();
+    const incoming_writer = &incoming_builder.writer;
+
+    var i: usize = 0;
+    while (i < 80) : (i += 1) {
+        if (i > 0) try incoming_writer.writeByte(',');
+        try incoming_writer.print("vendor{d}={d}", .{ i, i });
+    }
+    const incoming = try incoming_builder.toOwnedSlice();
+    defer testing.allocator.free(incoming);
+
+    const dsc: DynamicSamplingContext = .{
+        .trace_id = "fedcba9876543210fedcba9876543210".*,
+        .public_key = "pk",
+    };
+
+    const merged = try mergeBaggageAlloc(testing.allocator, incoming, dsc);
+    defer testing.allocator.free(merged);
+
+    try testing.expect(countBaggageMembers(merged) <= max_baggage_members);
+    try testing.expect(std.mem.indexOf(u8, merged, "vendor0=0") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "vendor79=79") == null);
+}
+
+test "mergeBaggageAlloc caps total baggage size" {
+    const large_value = try testing.allocator.alloc(u8, 9000);
+    defer testing.allocator.free(large_value);
+    @memset(large_value, 'a');
+
+    const incoming = try std.fmt.allocPrint(testing.allocator, "vendor={s},ok=1", .{large_value});
+    defer testing.allocator.free(incoming);
+
+    const dsc: DynamicSamplingContext = .{
+        .trace_id = "fedcba9876543210fedcba9876543210".*,
+        .public_key = "pk",
+    };
+
+    const merged = try mergeBaggageAlloc(testing.allocator, incoming, dsc);
+    defer testing.allocator.free(merged);
+
+    try testing.expect(merged.len <= max_baggage_size);
+    try testing.expect(std.mem.indexOf(u8, merged, "ok=1") != null);
+    try testing.expect(std.mem.indexOf(u8, merged, "vendor=") == null);
 }

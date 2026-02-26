@@ -129,6 +129,7 @@ pub const Transaction = struct {
     parent_sampled: ?bool = null,
     release: ?[]const u8 = null,
     environment: ?[]const u8 = null,
+    incoming_baggage: ?[]u8 = null,
 
     /// Create a new transaction.
     pub fn init(allocator: Allocator, opts: TransactionOpts) Transaction {
@@ -153,6 +154,9 @@ pub const Transaction = struct {
 
     /// Free resources.
     pub fn deinit(self: *Transaction) void {
+        if (self.incoming_baggage) |value| {
+            self.allocator.free(value);
+        }
         for (self.spans.items) |span| {
             self.allocator.destroy(span);
         }

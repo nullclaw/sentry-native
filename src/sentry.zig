@@ -59,6 +59,7 @@ pub const parseBaggage = @import("propagation.zig").parseBaggage;
 pub const parseBaggageAlloc = @import("propagation.zig").parseBaggageAlloc;
 pub const formatSentryTraceAlloc = @import("propagation.zig").formatSentryTraceAlloc;
 pub const formatBaggageAlloc = @import("propagation.zig").formatBaggageAlloc;
+pub const mergeBaggageAlloc = @import("propagation.zig").mergeBaggageAlloc;
 pub const Uuid = @import("uuid.zig").Uuid;
 pub const timestamp = @import("timestamp.zig");
 pub const Worker = @import("worker.zig").Worker;

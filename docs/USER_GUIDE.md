@@ -320,6 +320,9 @@ const baggage = try client.baggageHeader(&txn, allocator);
 defer allocator.free(baggage);
 ```
 
+When a transaction was started from incoming `baggage`, third-party baggage members are preserved
+in downstream headers while `sentry-*` members are refreshed from the current transaction context.
+
 You can parse incoming baggage directly:
 
 ```zig

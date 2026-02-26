@@ -642,7 +642,11 @@ pub const Client = struct {
             }
         }
 
-        return self.startTransaction(real_opts);
+        var txn = self.startTransaction(real_opts);
+        if (baggage_header) |baggage| {
+            txn.incoming_baggage = try self.allocator.dupe(u8, baggage);
+        }
+        return txn;
     }
 
     /// Build `sentry-trace` header value for an outgoing downstream request.
@@ -666,7 +670,7 @@ pub const Client = struct {
             .sample_rate = txn.sample_rate,
             .sampled = txn.sampled,
         };
-        return propagation.formatBaggageAlloc(allocator, dsc);
+        return propagation.mergeBaggageAlloc(allocator, txn.incoming_baggage, dsc);
     }
 
     /// Finish a transaction, serialize it, and submit the envelope to the worker.
@@ -1827,6 +1831,35 @@ test "Client sentryTraceHeader and baggageHeader include expected values" {
     try testing.expect(std.mem.indexOf(u8, baggage, "sentry-public_key=examplePublicKey") != null);
     try testing.expect(std.mem.indexOf(u8, baggage, "sentry-release=my-app%401.0.0") != null);
     try testing.expect(std.mem.indexOf(u8, baggage, "sentry-environment=staging") != null);
+}
+
+test "Client baggageHeader preserves third-party incoming baggage members" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = try client.startTransactionFromPropagationHeaders(
+        .{ .name = "GET /merged-baggage", .op = "http.server" },
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-89abcdef01234567-1",
+        "vendor=one,foo=bar,sentry-trace_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,sentry-public_key=oldkey,sentry-release=legacy",
+    );
+    defer txn.deinit();
+
+    const baggage = try client.baggageHeader(&txn, testing.allocator);
+    defer testing.allocator.free(baggage);
+
+    const expected_trace = try std.fmt.allocPrint(testing.allocator, "sentry-trace_id={s}", .{txn.trace_id[0..]});
+    defer testing.allocator.free(expected_trace);
+
+    try testing.expect(std.mem.indexOf(u8, baggage, "vendor=one") != null);
+    try testing.expect(std.mem.indexOf(u8, baggage, "foo=bar") != null);
+    try testing.expect(std.mem.indexOf(u8, baggage, expected_trace) != null);
+    try testing.expect(std.mem.indexOf(u8, baggage, "sentry-public_key=examplePublicKey") != null);
+    try testing.expect(std.mem.indexOf(u8, baggage, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == null);
+    try testing.expect(std.mem.indexOf(u8, baggage, "sentry-release=legacy") == null);
 }
 
 test "Client captureMessageId stores last event id" {
