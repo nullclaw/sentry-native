@@ -109,6 +109,7 @@ pub const Span = struct {
 
 /// A distributed tracing transaction.
 pub const Transaction = struct {
+    event_id: [32]u8,
     trace_id: [32]u8,
     span_id: SpanId,
     name: []const u8,
@@ -126,9 +127,11 @@ pub const Transaction = struct {
 
     /// Create a new transaction.
     pub fn init(allocator: Allocator, opts: TransactionOpts) Transaction {
-        const uuid = Uuid.v4();
+        const trace_uuid = Uuid.v4();
+        const event_uuid = Uuid.v4();
         return Transaction{
-            .trace_id = uuid.toHex(),
+            .event_id = event_uuid.toHex(),
+            .trace_id = trace_uuid.toHex(),
             .span_id = generateSpanId(),
             .name = opts.name,
             .op = opts.op,
@@ -181,6 +184,9 @@ pub const Transaction = struct {
         const w = &aw.writer;
 
         try w.writeAll("{\"type\":\"transaction\"");
+        try w.writeAll(",\"event_id\":\"");
+        try w.writeAll(&self.event_id);
+        try w.writeByte('"');
 
         try w.writeAll(",\"transaction\":");
         try json.Stringify.value(self.name, .{}, w);
@@ -292,6 +298,12 @@ test "Transaction.init creates valid trace" {
         try testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
     }
 
+    // event_id should be 32 hex chars
+    try testing.expectEqual(@as(usize, 32), txn.event_id.len);
+    for (txn.event_id) |c| {
+        try testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+    }
+
     // start_timestamp should be reasonable
     try testing.expect(txn.start_timestamp > 1704067200.0);
 }
@@ -368,6 +380,8 @@ test "Transaction.toJson produces valid JSON with transaction name, op, spans ar
 
     // Verify transaction name
     try testing.expect(std.mem.indexOf(u8, json_str, "\"transaction\":\"GET /api\"") != null);
+    // Verify event_id
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"event_id\":\"") != null);
     // Verify type
     try testing.expect(std.mem.indexOf(u8, json_str, "\"type\":\"transaction\"") != null);
     // Verify op in trace context

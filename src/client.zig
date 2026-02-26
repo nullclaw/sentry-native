@@ -13,7 +13,8 @@ const Breadcrumb = event_mod.Breadcrumb;
 const ExceptionValue = event_mod.ExceptionValue;
 const ExceptionInterface = event_mod.ExceptionInterface;
 const Message = event_mod.Message;
-const Scope = @import("scope.zig").Scope;
+const scope_mod = @import("scope.zig");
+const Scope = scope_mod.Scope;
 const Session = @import("session.zig").Session;
 const SessionStatus = @import("session.zig").SessionStatus;
 const Transport = @import("transport.zig").Transport;
@@ -37,6 +38,8 @@ pub const Options = struct {
     before_send: ?*const fn (*Event) ?*Event = null, // return null to drop
     cache_dir: []const u8 = "/tmp/sentry-zig",
     install_signal_handlers: bool = true,
+    auto_session_tracking: bool = false,
+    shutdown_timeout_ms: u64 = 2000,
 };
 
 /// The Sentry client, tying together DSN, Scope, Transport, Worker, and Session.
@@ -54,6 +57,9 @@ pub const Client = struct {
     /// Initialize a new Client. Heap-allocates the Client struct so that
     /// internal pointers (e.g., the Worker's send_ctx) remain stable.
     pub fn init(allocator: Allocator, options: Options) !*Client {
+        if (!isValidSampleRate(options.sample_rate)) return error.InvalidSampleRate;
+        if (!isValidSampleRate(options.traces_sample_rate)) return error.InvalidTracesSampleRate;
+
         const self = try allocator.create(Client);
         errdefer allocator.destroy(self);
 
@@ -77,6 +83,8 @@ pub const Client = struct {
 
         try self.worker.start();
 
+        std.fs.cwd().makePath(options.cache_dir) catch {};
+
         // Install signal handlers if requested
         if (options.install_signal_handlers) {
             signal_handler.install(options.cache_dir);
@@ -87,13 +95,19 @@ pub const Client = struct {
             self.captureCrashEvent(signal_num);
         }
 
+        if (options.auto_session_tracking) {
+            self.startSession();
+        }
+
         return self;
     }
 
     /// Shut down the client, flushing pending events and freeing resources.
     pub fn deinit(self: *Client) void {
+        self.endSession(.exited);
+
         // Flush remaining events
-        _ = self.worker.flush(5000);
+        _ = self.worker.flush(self.options.shutdown_timeout_ms);
 
         // Shutdown worker thread
         self.worker.shutdown();
@@ -122,7 +136,7 @@ pub const Client = struct {
     /// Capture an exception event.
     pub fn captureException(self: *Client, exception_type: []const u8, value: []const u8) void {
         const values = [_]ExceptionValue{.{
-            .@"type" = exception_type,
+            .type = exception_type,
             .value = value,
         }};
         var event = Event.initException(&values);
@@ -143,62 +157,45 @@ pub const Client = struct {
             if (event.server_name == null) event.server_name = sn;
         }
 
+        // Apply scope to event
+        const applied = self.scope.applyToEvent(self.allocator, event) catch return;
+        defer scope_mod.cleanupAppliedToEvent(self.allocator, event, applied);
+
+        var prepared_event = event;
+
+        // Run before_send callback
+        if (self.options.before_send) |before_send| {
+            if (before_send(prepared_event)) |processed_event| {
+                prepared_event = processed_event;
+            } else {
+                return;
+            }
+        }
+
+        // Update session based on the prepared event before applying sampling.
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.session) |*s| {
+                if (prepared_event.level) |level| {
+                    if (level == .err or level == .fatal) {
+                        s.markErrored();
+                    }
+                }
+                if (s.dirty) {
+                    _ = self.sendSessionUpdate(s);
+                }
+            }
+        }
+
         // Sample rate check
         if (self.options.sample_rate < 1.0) {
             const rand_val = std.crypto.random.float(f64);
             if (rand_val >= self.options.sample_rate) return;
         }
 
-        // Apply scope to event
-        self.scope.applyToEvent(self.allocator, event) catch return;
-
-        // Free allocations made by applyToEvent after we are done with the event
-        defer {
-            if (event.tags) |t| {
-                if (t == .object) {
-                    var obj = t.object;
-                    obj.deinit();
-                    event.tags = null;
-                }
-            }
-            if (event.extra) |e| {
-                if (e == .object) {
-                    var obj = e.object;
-                    obj.deinit();
-                    event.extra = null;
-                }
-            }
-            if (event.contexts) |c| {
-                if (c == .object) {
-                    var obj = c.object;
-                    obj.deinit();
-                    event.contexts = null;
-                }
-            }
-            if (event.breadcrumbs) |b| {
-                self.allocator.free(b);
-                event.breadcrumbs = null;
-            }
-        }
-
-        // Run before_send callback
-        if (self.options.before_send) |before_send| {
-            if (before_send(event) == null) return; // event dropped
-        }
-
-        // Mark session errored if error or fatal level
-        if (event.level) |level| {
-            if (level == .err or level == .fatal) {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-                if (self.session) |*s| {
-                    s.markErrored();
-                }
-            }
-        }
-
         // Serialize event to envelope
-        const data = self.serializeEventEnvelope(event) catch return;
+        const data = self.serializeEventEnvelope(prepared_event) catch return;
 
         // Submit to worker queue (worker takes ownership of data)
         self.worker.submit(data) catch {
@@ -254,10 +251,13 @@ pub const Client = struct {
         if (real_opts.environment == null) real_opts.environment = self.options.environment;
 
         // Apply traces sample rate
-        if (real_opts.sample_rate == 1.0 and self.options.traces_sample_rate < 1.0) {
+        if (real_opts.sample_rate == 1.0) {
             real_opts.sample_rate = self.options.traces_sample_rate;
+        }
+
+        if (real_opts.sampled and real_opts.sample_rate < 1.0) {
             const rand_val = std.crypto.random.float(f64);
-            real_opts.sampled = rand_val < self.options.traces_sample_rate;
+            real_opts.sampled = rand_val < real_opts.sample_rate;
         }
 
         return Transaction.init(self.allocator, real_opts);
@@ -291,7 +291,7 @@ pub const Client = struct {
         // End any existing session first
         if (self.session) |*s| {
             s.end(.exited);
-            self.sendSessionUpdate(s);
+            _ = self.sendSessionUpdate(s);
         }
 
         const release = self.options.release orelse "unknown";
@@ -306,7 +306,7 @@ pub const Client = struct {
 
         if (self.session) |*s| {
             s.end(status);
-            self.sendSessionUpdate(s);
+            _ = self.sendSessionUpdate(s);
             self.session = null;
         }
     }
@@ -346,7 +346,7 @@ pub const Client = struct {
         // Use exception interface with stack-local values — safe because captureEvent
         // serializes synchronously before returning
         const values = [_]ExceptionValue{.{
-            .@"type" = "NativeCrash",
+            .type = "NativeCrash",
             .value = msg,
         }};
         event.exception = .{ .values = &values };
@@ -361,13 +361,14 @@ pub const Client = struct {
     }
 
     fn serializeTransactionEnvelope(self: *Client, txn: *const Transaction, txn_json: []const u8) ![]u8 {
-        _ = txn;
         var aw: Writer.Allocating = .init(self.allocator);
         errdefer aw.deinit();
         const w = &aw.writer;
 
         // Envelope header
-        try w.writeAll("{\"dsn\":\"");
+        try w.writeAll("{\"event_id\":\"");
+        try w.writeAll(&txn.event_id);
+        try w.writeAll("\",\"dsn\":\"");
         try self.dsn.writeDsn(w);
         try w.writeAll("\",\"sent_at\":\"");
         const ts = @import("timestamp.zig");
@@ -392,25 +393,34 @@ pub const Client = struct {
         return try aw.toOwnedSlice();
     }
 
-    fn sendSessionUpdate(self: *Client, session: *const Session) void {
-        const session_json = session.toJson(self.allocator) catch return;
+    fn sendSessionUpdate(self: *Client, session: *Session) bool {
+        const session_json = session.toJson(self.allocator) catch return false;
         defer self.allocator.free(session_json);
 
         var aw: Writer.Allocating = .init(self.allocator);
 
         envelope.serializeSessionEnvelope(self.dsn, session_json, &aw.writer) catch {
             aw.deinit();
-            return;
+            return false;
         };
 
         const data = aw.toOwnedSlice() catch {
             aw.deinit();
-            return;
+            return false;
         };
 
         self.worker.submit(data) catch {
             self.allocator.free(data);
+            return false;
         };
+
+        session.markSent();
+        return true;
+    }
+
+    fn isValidSampleRate(rate: f64) bool {
+        if (!std.math.isFinite(rate)) return false;
+        return rate >= 0.0 and rate <= 1.0;
     }
 };
 
@@ -428,6 +438,8 @@ test "Options struct has correct defaults" {
     try testing.expect(opts.server_name == null);
     try testing.expect(opts.before_send == null);
     try testing.expect(opts.install_signal_handlers);
+    try testing.expect(!opts.auto_session_tracking);
+    try testing.expectEqual(@as(u64, 2000), opts.shutdown_timeout_ms);
     try testing.expectEqualStrings("/tmp/sentry-zig", opts.cache_dir);
 }
 

@@ -1,0 +1,27 @@
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Sentry-Zig runtime artifacts
+.sentry-zig-crash
+*.core
+
+# Local env / temp
+.env
+.env.local
+.direnv/
+tmp/
+*.log
+*.tmp
+
+# Editors / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Local reference SDK checkouts (kept out of git history)
+reference/*
+!reference/README.md
+!reference/fetch-sources.sh

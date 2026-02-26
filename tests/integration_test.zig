@@ -81,7 +81,7 @@ test "Event creation and JSON serialization" {
 
 test "Exception event creation and serialization" {
     const values = [_]sentry.ExceptionValue{.{
-        .@"type" = "RuntimeError",
+        .type = "RuntimeError",
         .value = "something went wrong",
     }};
     const event = sentry.Event.initException(&values);
@@ -132,18 +132,8 @@ test "Scope enriches events with user, tags, and breadcrumbs" {
 
     // Create an event and apply scope
     var event = sentry.Event.init();
-    try scope.applyToEvent(testing.allocator, &event);
-
-    // Cleanup allocated resources
-    defer {
-        if (event.tags) |t| {
-            var tags_obj = t.object;
-            tags_obj.deinit();
-        }
-        if (event.breadcrumbs) |b| {
-            testing.allocator.free(b);
-        }
-    }
+    const applied = try scope.applyToEvent(testing.allocator, &event);
+    defer sentry.cleanupAppliedToEvent(testing.allocator, &event, applied);
 
     // Verify user was applied
     try testing.expect(event.user != null);

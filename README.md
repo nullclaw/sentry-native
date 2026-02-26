@@ -132,6 +132,8 @@ All options are set via the `Options` struct passed to `sentry.init`:
 | `before_send`             | `?*const fn (*Event) ?*Event`     | `null`               | Pre-send hook (return null to drop)      |
 | `cache_dir`               | `[]const u8`                      | `"/tmp/sentry-zig"`  | Directory for crash marker files         |
 | `install_signal_handlers` | `bool`                            | `true`               | Install POSIX crash signal handlers      |
+| `auto_session_tracking`   | `bool`                            | `false`              | Start a release-health session on init   |
+| `shutdown_timeout_ms`     | `u64`                             | `2000`               | Flush timeout used during `deinit`       |
 
 ## Testing
 

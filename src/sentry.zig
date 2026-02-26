@@ -21,6 +21,7 @@ pub const Session = @import("session.zig").Session;
 pub const SessionStatus = @import("session.zig").SessionStatus;
 pub const Dsn = @import("dsn.zig").Dsn;
 pub const Scope = @import("scope.zig").Scope;
+pub const cleanupAppliedToEvent = @import("scope.zig").cleanupAppliedToEvent;
 pub const Transport = @import("transport.zig").Transport;
 pub const MockTransport = @import("transport.zig").MockTransport;
 pub const envelope = @import("envelope.zig");

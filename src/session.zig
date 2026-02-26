@@ -43,6 +43,7 @@ pub const Session = struct {
     release: []const u8,
     environment: []const u8,
     duration: ?f64 = null,
+    dirty: bool = true,
 
     /// Create a new session with the given release and environment.
     pub fn start(release: []const u8, environment: []const u8) Session {
@@ -65,12 +66,14 @@ pub const Session = struct {
             self.status = .errored;
         }
         self.timestamp = ts.now();
+        self.dirty = true;
     }
 
     /// Mark the session as crashed.
     pub fn markCrashed(self: *Session) void {
         self.status = .crashed;
         self.timestamp = ts.now();
+        self.dirty = true;
     }
 
     /// End the session with the given status, computing duration.
@@ -78,6 +81,13 @@ pub const Session = struct {
         self.status = status;
         self.timestamp = ts.now();
         self.duration = self.timestamp - self.started;
+        self.dirty = true;
+    }
+
+    /// Mark the latest update as sent.
+    pub fn markSent(self: *Session) void {
+        self.init_flag = false;
+        self.dirty = false;
     }
 
     /// Serialize the session to JSON for envelope payload.

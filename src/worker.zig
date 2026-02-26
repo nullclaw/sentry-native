@@ -18,6 +18,7 @@ pub const Worker = struct {
     condition: std.Thread.Condition = .{},
     flush_condition: std.Thread.Condition = .{},
     shutdown_flag: bool = false,
+    in_flight: usize = 0,
     thread: ?std.Thread = null,
     send_fn: SendFn,
     send_ctx: ?*anyopaque = null,
@@ -69,16 +70,21 @@ pub const Worker = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.queue.items.len == 0) return true;
+        const timeout_ns: i128 = @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
+        const deadline = std.time.nanoTimestamp() + timeout_ns;
 
-        // Wake the worker to process items
-        self.condition.signal();
+        while (self.queue.items.len > 0 or self.in_flight > 0) {
+            // Wake the worker to process queued items.
+            self.condition.signal();
 
-        self.flush_condition.timedWait(&self.mutex, timeout_ms * std.time.ns_per_ms) catch {
-            return self.queue.items.len == 0;
-        };
+            const now = std.time.nanoTimestamp();
+            if (now >= deadline) return false;
 
-        return self.queue.items.len == 0;
+            const remaining: u64 = @intCast(deadline - now);
+            self.flush_condition.timedWait(&self.mutex, remaining) catch {};
+        }
+
+        return true;
     }
 
     /// Signal shutdown and wait for the worker thread to finish.
@@ -115,16 +121,17 @@ pub const Worker = struct {
                     self.condition.wait(&self.mutex);
                 }
 
-                if (self.shutdown_flag and self.queue.items.len == 0) {
+                if (self.shutdown_flag and self.queue.items.len == 0 and self.in_flight == 0) {
                     self.flush_condition.signal();
                     return;
                 }
 
                 if (self.queue.items.len > 0) {
                     item = self.queue.orderedRemove(0);
+                    self.in_flight += 1;
                 }
 
-                if (self.queue.items.len == 0) {
+                if (self.queue.items.len == 0 and self.in_flight == 0) {
                     self.flush_condition.signal();
                 }
             }
@@ -132,6 +139,13 @@ pub const Worker = struct {
             if (item) |work| {
                 defer self.allocator.free(work.data);
                 self.send_fn(work.data, self.send_ctx);
+
+                self.mutex.lock();
+                self.in_flight -= 1;
+                if (self.queue.items.len == 0 and self.in_flight == 0) {
+                    self.flush_condition.signal();
+                }
+                self.mutex.unlock();
             }
         }
     }

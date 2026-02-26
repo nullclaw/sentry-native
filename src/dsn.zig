@@ -13,6 +13,7 @@ pub const DsnError = error{
 pub const Dsn = struct {
     scheme: []const u8,
     public_key: []const u8,
+    secret_key: ?[]const u8,
     host: []const u8,
     port: ?u16,
     path: []const u8,
@@ -21,60 +22,41 @@ pub const Dsn = struct {
     /// Parse a Sentry DSN string.
     /// Format: {PROTOCOL}://{PUBLIC_KEY}@{HOST}/{PATH}{PROJECT_ID}
     pub fn parse(dsn_string: []const u8) DsnError!Dsn {
-        // Find scheme separator "://"
-        const scheme_end = mem.indexOf(u8, dsn_string, "://") orelse return DsnError.InvalidDsn;
-        const scheme = dsn_string[0..scheme_end];
-        if (scheme.len == 0) return DsnError.InvalidDsn;
+        const uri = std.Uri.parse(dsn_string) catch return DsnError.InvalidDsn;
+        if (uri.scheme.len == 0) return DsnError.InvalidDsn;
 
-        const after_scheme = dsn_string[scheme_end + 3 ..];
-
-        // Find '@' to separate public_key from host
-        const at_pos = mem.indexOf(u8, after_scheme, "@") orelse return DsnError.MissingPublicKey;
-        const public_key = after_scheme[0..at_pos];
+        const user = uri.user orelse return DsnError.MissingPublicKey;
+        const public_key = componentSlice(user);
         if (public_key.len == 0) return DsnError.MissingPublicKey;
 
-        const after_at = after_scheme[at_pos + 1 ..];
-        if (after_at.len == 0) return DsnError.MissingHost;
-
-        // Find the first '/' after host (and optional port)
-        const slash_pos = mem.indexOf(u8, after_at, "/") orelse return DsnError.MissingProjectId;
-        const host_port = after_at[0..slash_pos];
-        if (host_port.len == 0) return DsnError.MissingHost;
-
-        const after_host_slash = after_at[slash_pos + 1 ..];
-
-        // Parse host and optional port
-        var host: []const u8 = undefined;
-        var port: ?u16 = null;
-        if (mem.indexOf(u8, host_port, ":")) |colon_pos| {
-            host = host_port[0..colon_pos];
-            const port_str = host_port[colon_pos + 1 ..];
-            port = std.fmt.parseInt(u16, port_str, 10) catch return DsnError.InvalidDsn;
-        } else {
-            host = host_port;
-        }
+        const host_component = uri.host orelse return DsnError.MissingHost;
+        const host = componentSlice(host_component);
         if (host.len == 0) return DsnError.MissingHost;
 
-        // The rest is path + project_id. The project_id is the last path segment.
-        // e.g., "my/path/42" => path="my/path/", project_id="42"
-        // e.g., "42" => path="", project_id="42"
-        if (after_host_slash.len == 0) return DsnError.MissingProjectId;
+        var raw_path = componentSlice(uri.path);
+        if (raw_path.len == 0 or mem.eql(u8, raw_path, "/")) return DsnError.MissingProjectId;
+        if (raw_path[0] == '/') {
+            raw_path = raw_path[1..];
+        }
+        if (raw_path.len == 0) return DsnError.MissingProjectId;
 
         var path: []const u8 = "";
-        var project_id: []const u8 = after_host_slash;
+        var project_id: []const u8 = raw_path;
 
-        if (mem.lastIndexOf(u8, after_host_slash, "/")) |last_slash| {
-            path = after_host_slash[0 .. last_slash + 1];
-            project_id = after_host_slash[last_slash + 1 ..];
+        if (mem.lastIndexOfScalar(u8, raw_path, '/')) |last_slash| {
+            path = raw_path[0 .. last_slash + 1];
+            project_id = raw_path[last_slash + 1 ..];
         }
-
         if (project_id.len == 0) return DsnError.MissingProjectId;
 
+        const secret_key = if (uri.password) |pwd| componentSlice(pwd) else null;
+
         return Dsn{
-            .scheme = scheme,
+            .scheme = uri.scheme,
             .public_key = public_key,
+            .secret_key = secret_key,
             .host = host,
-            .port = port,
+            .port = uri.port,
             .path = path,
             .project_id = project_id,
         };
@@ -83,11 +65,24 @@ pub const Dsn = struct {
     /// Generate the envelope endpoint URL.
     /// Format: {scheme}://{host}[:{port}]/{path}api/{project_id}/envelope/
     pub fn getEnvelopeUrl(self: Dsn, allocator: Allocator) Allocator.Error![]u8 {
+        const ipv6 = isIpv6Host(self.host);
         if (self.port) |p| {
+            if (ipv6) {
+                return std.fmt.allocPrint(allocator, "{s}://[{s}]:{d}/{s}api/{s}/envelope/", .{
+                    self.scheme, self.host, p, self.path, self.project_id,
+                });
+            }
+
             return std.fmt.allocPrint(allocator, "{s}://{s}:{d}/{s}api/{s}/envelope/", .{
                 self.scheme, self.host, p, self.path, self.project_id,
             });
         } else {
+            if (ipv6) {
+                return std.fmt.allocPrint(allocator, "{s}://[{s}]/{s}api/{s}/envelope/", .{
+                    self.scheme, self.host, self.path, self.project_id,
+                });
+            }
+
             return std.fmt.allocPrint(allocator, "{s}://{s}/{s}api/{s}/envelope/", .{
                 self.scheme, self.host, self.path, self.project_id,
             });
@@ -96,7 +91,18 @@ pub const Dsn = struct {
 
     /// Reconstruct the original DSN string.
     pub fn writeDsn(self: Dsn, writer: anytype) !void {
-        try writer.print("{s}://{s}@{s}", .{ self.scheme, self.public_key, self.host });
+        try writer.print("{s}://{s}", .{ self.scheme, self.public_key });
+        if (self.secret_key) |secret| {
+            try writer.print(":{s}", .{secret});
+        }
+        try writer.writeByte('@');
+
+        if (isIpv6Host(self.host)) {
+            try writer.print("[{s}]", .{self.host});
+        } else {
+            try writer.writeAll(self.host);
+        }
+
         if (self.port) |p| {
             try writer.print(":{d}", .{p});
         }
@@ -104,12 +110,24 @@ pub const Dsn = struct {
     }
 };
 
+fn componentSlice(component: std.Uri.Component) []const u8 {
+    return switch (component) {
+        .raw => |s| s,
+        .percent_encoded => |s| s,
+    };
+}
+
+fn isIpv6Host(host: []const u8) bool {
+    return mem.indexOfScalar(u8, host, ':') != null;
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 test "parse standard DSN" {
     const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
     try testing.expectEqualStrings("https", dsn.scheme);
     try testing.expectEqualStrings("examplePublicKey", dsn.public_key);
+    try testing.expect(dsn.secret_key == null);
     try testing.expectEqualStrings("o0.ingest.sentry.io", dsn.host);
     try testing.expect(dsn.port == null);
     try testing.expectEqualStrings("", dsn.path);
@@ -124,6 +142,12 @@ test "parse DSN with port" {
     try testing.expectEqual(@as(u16, 9000), dsn.port.?);
     try testing.expectEqualStrings("", dsn.path);
     try testing.expectEqualStrings("42", dsn.project_id);
+}
+
+test "parse DSN with secret key" {
+    const dsn = try Dsn.parse("https://public:secret@sentry.example.com/42");
+    try testing.expectEqualStrings("public", dsn.public_key);
+    try testing.expectEqualStrings("secret", dsn.secret_key.?);
 }
 
 test "parse DSN with path" {
@@ -199,6 +223,16 @@ test "writeDsn roundtrip" {
 
 test "writeDsn roundtrip with port" {
     const original = "https://key@sentry.example.com:9000/42";
+    const dsn = try Dsn.parse(original);
+    var buf: [256]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    try dsn.writeDsn(stream.writer());
+    const written = stream.getWritten();
+    try testing.expectEqualStrings(original, written);
+}
+
+test "writeDsn roundtrip with secret key" {
+    const original = "https://public:secret@sentry.example.com/42";
     const dsn = try Dsn.parse(original);
     var buf: [256]u8 = undefined;
     var stream = std.io.fixedBufferStream(&buf);
