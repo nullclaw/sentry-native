@@ -79,6 +79,16 @@ pub const TransactionOrSpan = union(enum) {
     span: *const Span,
 };
 
+pub const TraceContext = struct {
+    trace_id: [32]u8,
+    span_id: SpanId,
+    parent_span_id: ?SpanId = null,
+    op: ?[]const u8 = null,
+    sampled: ?bool = null,
+    status: ?SpanStatus = null,
+    origin: ?[]const u8 = null,
+};
+
 /// Options for creating a transaction.
 pub const TransactionOpts = struct {
     name: []const u8,
@@ -151,6 +161,29 @@ pub const Span = struct {
 
     pub fn setData(self: *Span, key: []const u8, value: json.Value) !void {
         try setJsonMapEntry(self.allocator, &self.data, key, value);
+    }
+
+    pub fn getTraceContext(self: *const Span) TraceContext {
+        return .{
+            .trace_id = self.trace_id,
+            .span_id = self.span_id,
+            .parent_span_id = self.parent_span_id,
+            .op = self.op,
+            .sampled = self.sampled,
+            .status = self.status,
+            .origin = null,
+        };
+    }
+
+    pub fn getSpanId(self: *const Span) SpanId {
+        return self.span_id;
+    }
+
+    pub fn sentryTraceHeaderAlloc(self: *const Span, allocator: Allocator) ![]u8 {
+        if (self.sampled) {
+            return std.fmt.allocPrint(allocator, "{s}-{s}-1", .{ self.trace_id, self.span_id });
+        }
+        return std.fmt.allocPrint(allocator, "{s}-{s}-0", .{ self.trace_id, self.span_id });
     }
 
     pub fn startChild(self: *Span, opts: ChildSpanOpts) !*Span {
@@ -322,6 +355,25 @@ pub const Transaction = struct {
 
     pub fn isSampled(self: *const Transaction) bool {
         return self.sampled;
+    }
+
+    pub fn getTraceContext(self: *const Transaction) TraceContext {
+        return .{
+            .trace_id = self.trace_id,
+            .span_id = self.span_id,
+            .parent_span_id = self.parent_span_id,
+            .op = self.op,
+            .sampled = self.sampled,
+            .status = self.status,
+            .origin = self.origin,
+        };
+    }
+
+    pub fn sentryTraceHeaderAlloc(self: *const Transaction, allocator: Allocator) ![]u8 {
+        if (self.sampled) {
+            return std.fmt.allocPrint(allocator, "{s}-{s}-1", .{ self.trace_id, self.span_id });
+        }
+        return std.fmt.allocPrint(allocator, "{s}-{s}-0", .{ self.trace_id, self.span_id });
     }
 
     pub fn setTag(self: *Transaction, key: []const u8, value: []const u8) !void {
@@ -783,6 +835,27 @@ test "Span.finishWithTimestamp sets explicit timestamp and status" {
     try testing.expectEqual(SpanStatus.ok, span.status.?);
 }
 
+test "Span getTraceContext/getSpanId/sentryTraceHeaderAlloc expose trace metadata" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /span-context",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const span = try txn.startChild(.{ .op = "db.query" });
+    span.setStatus(.ok);
+
+    const context = span.getTraceContext();
+    try testing.expectEqualSlices(u8, txn.trace_id[0..], context.trace_id[0..]);
+    try testing.expectEqualSlices(u8, span.getSpanId()[0..], context.span_id[0..]);
+    try testing.expectEqual(@as(?SpanStatus, .ok), context.status);
+
+    const sentry_trace = try span.sentryTraceHeaderAlloc(testing.allocator);
+    defer testing.allocator.free(sentry_trace);
+    try testing.expect(std.mem.indexOf(u8, sentry_trace, txn.trace_id[0..]) != null);
+    try testing.expect(std.mem.indexOf(u8, sentry_trace, span.span_id[0..]) != null);
+}
+
 test "Transaction.finish sets timestamp" {
     var txn = Transaction.init(testing.allocator, .{
         .name = "POST /submit",
@@ -853,6 +926,26 @@ test "Transaction.toJson produces valid JSON with transaction name, op, spans ar
     try testing.expect(std.mem.indexOf(u8, json_str, "\"dist\":\"42\"") != null);
     // Verify environment
     try testing.expect(std.mem.indexOf(u8, json_str, "\"environment\":\"production\"") != null);
+}
+
+test "Transaction getTraceContext and sentryTraceHeaderAlloc expose trace metadata" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /txn-context",
+        .op = "http.server",
+        .sampled = false,
+    });
+    defer txn.deinit();
+
+    try txn.setOrigin("auto.http");
+    const context = txn.getTraceContext();
+    try testing.expectEqualSlices(u8, txn.trace_id[0..], context.trace_id[0..]);
+    try testing.expectEqualSlices(u8, txn.span_id[0..], context.span_id[0..]);
+    try testing.expectEqualStrings("auto.http", context.origin.?);
+
+    const sentry_trace = try txn.sentryTraceHeaderAlloc(testing.allocator);
+    defer testing.allocator.free(sentry_trace);
+    try testing.expect(std.mem.indexOf(u8, sentry_trace, txn.trace_id[0..]) != null);
+    try testing.expect(std.mem.endsWith(u8, sentry_trace, "-0"));
 }
 
 test "Transaction metadata setters serialize trace data tags extra and origin" {
