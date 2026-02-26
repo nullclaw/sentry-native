@@ -20,6 +20,16 @@ fn applyCheckoutIntegration(client: *sentry.Client, _: ?*anyopaque) void {
     });
 }
 
+fn dropTransactionBeforeSend(_: *sentry.Transaction) ?*sentry.Transaction {
+    return null;
+}
+
+fn rewriteTransactionBeforeSend(txn: *sentry.Transaction) ?*sentry.Transaction {
+    txn.op = "http.server.processed";
+    txn.name = "POST /checkout-processed";
+    return txn;
+}
+
 const CaptureRelay = struct {
     allocator: std.mem.Allocator,
     server: std.net.Server,
@@ -639,6 +649,65 @@ test "CJM e2e: transaction is sent when traces sample rate is enabled" {
     try testing.expect(relay.containsInAny("\"sample_rate\":1.000000"));
     try testing.expect(relay.containsInAny("\"release\":\"checkout@1.2.3\""));
     try testing.expect(relay.containsInAny("\"environment\":\"staging\""));
+}
+
+test "CJM e2e: before_send_transaction can drop transactions" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .before_send_transaction = dropTransactionBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "POST /checkout",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+
+    try testing.expectEqual(@as(usize, 0), relay.requestCount());
+}
+
+test "CJM e2e: before_send_transaction can mutate transactions in place" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .before_send_transaction = rewriteTransactionBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "POST /checkout",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"type\":\"transaction\""));
+    try testing.expect(relay.containsInAny("\"transaction\":\"POST /checkout-processed\""));
+    try testing.expect(relay.containsInAny("\"op\":\"http.server.processed\""));
 }
 
 test "CJM e2e: session emits errored and exited updates" {

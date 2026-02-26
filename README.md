@@ -198,6 +198,7 @@ All options are provided via `sentry.Options` in `sentry.init`.
 | `integrations` | `?[]const Integration` | `null` | Setup callbacks executed during client initialization |
 | `before_send` | `?*const fn (*Event) ?*Event` | `null` | Drop/mutate event before queueing |
 | `before_breadcrumb` | `?*const fn (Breadcrumb) ?Breadcrumb` | `null` | Drop/mutate breadcrumb |
+| `before_send_transaction` | `?*const fn (*Transaction) ?*Transaction` | `null` | Drop/mutate transaction before queueing |
 | `before_send_log` | `?*const fn (*LogEntry) ?*LogEntry` | `null` | Drop/mutate log entry before queueing |
 | `transport` | `?TransportConfig` | `null` | Custom transport callback override |
 | `http_proxy` | `?[]const u8` | `null` | Explicit HTTP proxy URL (fallback to env vars when unset) |

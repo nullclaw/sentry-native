@@ -67,6 +67,7 @@ pub const TracesSamplingContext = struct {
 
 pub const TracesSampler = *const fn (TracesSamplingContext) f64;
 pub const BeforeSendLog = *const fn (*LogEntry) ?*LogEntry;
+pub const BeforeSendTransaction = *const fn (*Transaction) ?*Transaction;
 pub const TransportSendFn = *const fn ([]const u8, ?*anyopaque) SendOutcome;
 pub const Integration = struct {
     setup: *const fn (*Client, ?*anyopaque) void,
@@ -96,6 +97,7 @@ pub const Options = struct {
     integrations: ?[]const Integration = null,
     before_send: ?*const fn (*Event) ?*Event = null, // return same pointer, or null to drop
     before_breadcrumb: ?*const fn (Breadcrumb) ?Breadcrumb = null, // return null to drop
+    before_send_transaction: ?BeforeSendTransaction = null, // return same pointer, or null to drop
     before_send_log: ?BeforeSendLog = null, // return same pointer, or null to drop
     transport: ?TransportConfig = null,
     http_proxy: ?[]const u8 = null,
@@ -681,12 +683,24 @@ pub const Client = struct {
 
         if (!txn.sampled) return;
 
+        var prepared_txn = txn;
+        if (self.options.before_send_transaction) |before_send_transaction| {
+            if (before_send_transaction(prepared_txn)) |processed_txn| {
+                // For memory safety, callbacks must mutate in place and return
+                // the same pointer. Returning a different pointer drops the transaction.
+                if (processed_txn != prepared_txn) return;
+                prepared_txn = processed_txn;
+            } else {
+                return;
+            }
+        }
+
         // Serialize transaction to JSON
-        const txn_json = txn.toJson(self.allocator) catch return;
+        const txn_json = prepared_txn.toJson(self.allocator) catch return;
         defer self.allocator.free(txn_json);
 
         // Create transaction envelope
-        const data = self.serializeTransactionEnvelope(txn, txn_json) catch return;
+        const data = self.serializeTransactionEnvelope(prepared_txn, txn_json) catch return;
 
         _ = self.submitEnvelope(data, .transaction);
     }
@@ -1167,6 +1181,7 @@ test "Options struct has correct defaults" {
     try testing.expect(opts.server_name == null);
     try testing.expect(opts.before_send == null);
     try testing.expect(opts.before_breadcrumb == null);
+    try testing.expect(opts.before_send_transaction == null);
     try testing.expect(opts.before_send_log == null);
     try testing.expect(opts.transport == null);
     try testing.expect(opts.http_proxy == null);
@@ -1223,6 +1238,7 @@ fn dropBreadcrumb(_: Breadcrumb) ?Breadcrumb {
 }
 
 var replacement_event_for_test: Event = undefined;
+var replacement_txn_for_test: Transaction = undefined;
 var replacement_log_for_test: LogEntry = undefined;
 
 fn replaceEventPointer(_: *Event) ?*Event {
@@ -1233,7 +1249,15 @@ fn replaceLogPointer(_: *LogEntry) ?*LogEntry {
     return &replacement_log_for_test;
 }
 
+fn replaceTransactionPointer(_: *Transaction) ?*Transaction {
+    return &replacement_txn_for_test;
+}
+
 fn dropEventBeforeSend(_: *Event) ?*Event {
+    return null;
+}
+
+fn dropTransactionBeforeSend(_: *Transaction) ?*Transaction {
     return null;
 }
 
@@ -1261,6 +1285,37 @@ fn customTransportSendFn(_: []const u8, ctx: ?*anyopaque) SendOutcome {
     const state: *CustomTransportState = @ptrCast(@alignCast(ctx.?));
     state.sent_count += 1;
     return .{};
+}
+
+const PayloadTransportState = struct {
+    allocator: Allocator,
+    sent_count: usize = 0,
+    last_payload: ?[]u8 = null,
+
+    fn init(allocator: Allocator) PayloadTransportState {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *PayloadTransportState) void {
+        if (self.last_payload) |payload| self.allocator.free(payload);
+        self.* = undefined;
+    }
+};
+
+fn payloadTransportSendFn(data: []const u8, ctx: ?*anyopaque) SendOutcome {
+    const state: *PayloadTransportState = @ptrCast(@alignCast(ctx.?));
+    state.sent_count += 1;
+    if (state.last_payload) |payload| state.allocator.free(payload);
+    state.last_payload = state.allocator.dupe(u8, data) catch null;
+    return .{};
+}
+
+var before_send_transaction_saw_expected_name: bool = false;
+
+fn inspectTransactionBeforeSend(txn: *Transaction) ?*Transaction {
+    before_send_transaction_saw_expected_name = std.mem.eql(u8, txn.name, "POST /checkout");
+    txn.op = "http.server.processed";
+    return txn;
 }
 
 fn testIntegrationSetup(_: *Client, ctx: ?*anyopaque) void {
@@ -1692,6 +1747,96 @@ test "Client custom transport receives submitted envelopes" {
     try testing.expect(client.captureMessageId("custom-transport", .warning) != null);
     _ = client.flush(1000);
     try testing.expectEqual(@as(usize, 1), state.sent_count);
+}
+
+test "Client before_send_transaction drops replacement pointers for memory safety" {
+    replacement_txn_for_test = Transaction.init(testing.allocator, .{
+        .name = "replacement",
+    });
+    defer replacement_txn_for_test.deinit();
+
+    var state = CustomTransportState{};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .before_send_transaction = replaceTransactionPointer,
+        .transport = .{
+            .send_fn = customTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "original",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 0), state.sent_count);
+}
+
+test "Client before_send_transaction can drop transaction events" {
+    var state = CustomTransportState{};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .before_send_transaction = dropTransactionBeforeSend,
+        .transport = .{
+            .send_fn = customTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "drop-txn",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    _ = client.flush(1000);
+
+    try testing.expectEqual(@as(usize, 0), state.sent_count);
+}
+
+test "Client before_send_transaction can mutate in place" {
+    before_send_transaction_saw_expected_name = false;
+
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .before_send_transaction = inspectTransactionBeforeSend,
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "POST /checkout",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    client.finishTransaction(&txn);
+    _ = client.flush(1000);
+
+    try testing.expect(before_send_transaction_saw_expected_name);
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"op\":\"http.server.processed\"") != null);
 }
 
 test "Client before_send drops replacement pointers for memory safety" {

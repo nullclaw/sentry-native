@@ -406,6 +406,16 @@ fn beforeSend(event: *sentry.Event) ?*sentry.Event {
 }
 ```
 
+### `before_send_transaction`
+
+```zig
+fn beforeSendTransaction(txn: *sentry.Transaction) ?*sentry.Transaction {
+    if (std.mem.eql(u8, txn.name, "GET /health")) return null;
+    txn.op = "http.server.processed";
+    return txn; // return the same pointer
+}
+```
+
 ### `before_breadcrumb`
 
 ```zig

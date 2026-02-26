@@ -20,6 +20,7 @@ pub const SessionMode = @import("client.zig").SessionMode;
 pub const TracesSamplingContext = @import("client.zig").TracesSamplingContext;
 pub const TracesSampler = @import("client.zig").TracesSampler;
 pub const BeforeSendLog = @import("client.zig").BeforeSendLog;
+pub const BeforeSendTransaction = @import("client.zig").BeforeSendTransaction;
 pub const TransportConfig = @import("client.zig").TransportConfig;
 pub const Integration = @import("client.zig").Integration;
 pub const Event = @import("event.zig").Event;
