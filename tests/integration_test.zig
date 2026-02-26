@@ -756,6 +756,53 @@ test "CJM e2e: transaction metadata setters serialize trace data tags and extras
     try testing.expect(relay.containsInAny("\"rows\":1"));
 }
 
+test "CJM e2e: transaction and span request metadata is serialized" {
+    var relay = try CaptureRelay.init(testing.allocator, &.{});
+    defer relay.deinit();
+    try relay.start();
+
+    const local_dsn = try makeLocalDsn(testing.allocator, relay.port());
+    defer testing.allocator.free(local_dsn);
+
+    const client = try sentry.init(testing.allocator, .{
+        .dsn = local_dsn,
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var txn = client.startTransaction(.{
+        .name = "POST /checkout-request",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    try txn.setRequest(.{
+        .method = "POST",
+        .url = "https://api.example.com/orders",
+        .query_string = "preview=true",
+    });
+
+    const span = try txn.startChild(.{
+        .op = "http.client",
+        .description = "POST payment gateway",
+    });
+    try span.setRequest(.{
+        .method = "POST",
+        .url = "https://payments.example.com/charge",
+    });
+    span.finish();
+
+    client.finishTransaction(&txn);
+    try testing.expect(client.flush(2000));
+    try testing.expect(relay.waitForAtLeast(1, 2000));
+
+    try testing.expect(relay.containsInAny("\"request\":{"));
+    try testing.expect(relay.containsInAny("\"url\":\"https://api.example.com/orders\""));
+    try testing.expect(relay.containsInAny("\"query_string\":\"preview=true\""));
+    try testing.expect(relay.containsInAny("\"url\":\"https://payments.example.com/charge\""));
+}
+
 test "CJM e2e: before_send_transaction can drop transactions" {
     var relay = try CaptureRelay.init(testing.allocator, &.{});
     defer relay.deinit();

@@ -41,6 +41,7 @@ pub const Span = @import("transaction.zig").Span;
 pub const SpanStatus = @import("transaction.zig").SpanStatus;
 pub const TransactionOrSpan = @import("transaction.zig").TransactionOrSpan;
 pub const TraceContext = @import("transaction.zig").TraceContext;
+pub const Request = @import("transaction.zig").Request;
 pub const MAX_SPANS = @import("transaction.zig").MAX_SPANS;
 pub const Session = @import("session.zig").Session;
 pub const SessionStatus = @import("session.zig").SessionStatus;

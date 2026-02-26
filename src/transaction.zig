@@ -89,6 +89,16 @@ pub const TraceContext = struct {
     origin: ?[]const u8 = null,
 };
 
+pub const Request = struct {
+    method: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    data: ?[]const u8 = null,
+    query_string: ?[]const u8 = null,
+    cookies: ?[]const u8 = null,
+    headers: ?json.Value = null,
+    env: ?json.Value = null,
+};
+
 /// Options for creating a transaction.
 pub const TransactionOpts = struct {
     name: []const u8,
@@ -163,6 +173,16 @@ pub const Span = struct {
         try setJsonMapEntry(self.allocator, &self.data, key, value);
     }
 
+    pub fn setRequest(self: *Span, request: Request) !void {
+        if (request.method) |value| try self.setData("method", .{ .string = value });
+        if (request.url) |value| try self.setData("url", .{ .string = value });
+        if (request.data) |value| try self.setData("data", .{ .string = value });
+        if (request.query_string) |value| try self.setData("query_string", .{ .string = value });
+        if (request.cookies) |value| try self.setData("cookies", .{ .string = value });
+        if (request.headers) |value| try self.setData("headers", value);
+        if (request.env) |value| try self.setData("env", value);
+    }
+
     pub fn getTraceContext(self: *const Span) TraceContext {
         return .{
             .trace_id = self.trace_id,
@@ -224,6 +244,7 @@ pub const Transaction = struct {
     extra: std.StringHashMap(json.Value),
     trace_data: std.StringHashMap(json.Value),
     origin: ?[]u8 = null,
+    request: ?json.Value = null,
     allocator: Allocator,
     sampled: bool = true,
     sample_rate: f64 = 1.0,
@@ -265,6 +286,10 @@ pub const Transaction = struct {
         }
         if (self.origin) |value| {
             self.allocator.free(value);
+        }
+        if (self.request) |*value| {
+            scope_mod.deinitJsonValueDeep(self.allocator, value);
+            self.request = null;
         }
         for (self.spans.items) |span| {
             span.deinit();
@@ -396,6 +421,27 @@ pub const Transaction = struct {
         self.origin = replacement;
     }
 
+    pub fn setRequest(self: *Transaction, request: Request) !void {
+        var obj = json.ObjectMap.init(self.allocator);
+        errdefer {
+            var value: json.Value = .{ .object = obj };
+            scope_mod.deinitJsonValueDeep(self.allocator, &value);
+        }
+
+        if (request.method) |value| try putOwnedJsonEntry(self.allocator, &obj, "method", .{ .string = try self.allocator.dupe(u8, value) });
+        if (request.url) |value| try putOwnedJsonEntry(self.allocator, &obj, "url", .{ .string = try self.allocator.dupe(u8, value) });
+        if (request.data) |value| try putOwnedJsonEntry(self.allocator, &obj, "data", .{ .string = try self.allocator.dupe(u8, value) });
+        if (request.query_string) |value| try putOwnedJsonEntry(self.allocator, &obj, "query_string", .{ .string = try self.allocator.dupe(u8, value) });
+        if (request.cookies) |value| try putOwnedJsonEntry(self.allocator, &obj, "cookies", .{ .string = try self.allocator.dupe(u8, value) });
+        if (request.headers) |value| try putOwnedJsonEntry(self.allocator, &obj, "headers", try scope_mod.cloneJsonValue(self.allocator, value));
+        if (request.env) |value| try putOwnedJsonEntry(self.allocator, &obj, "env", try scope_mod.cloneJsonValue(self.allocator, value));
+
+        if (self.request) |*existing| {
+            scope_mod.deinitJsonValueDeep(self.allocator, existing);
+        }
+        self.request = .{ .object = obj };
+    }
+
     /// Serialize the transaction to JSON for envelope payload.
     pub fn toJson(self: *const Transaction, allocator: Allocator) ![]u8 {
         var aw: Writer.Allocating = .init(allocator);
@@ -471,6 +517,11 @@ pub const Transaction = struct {
         if (self.environment) |env| {
             try w.writeAll(",\"environment\":");
             try json.Stringify.value(env, .{}, w);
+        }
+
+        if (self.request) |request| {
+            try w.writeAll(",\"request\":");
+            try json.Stringify.value(request, .{}, w);
         }
 
         // Spans array
@@ -619,6 +670,24 @@ fn writeJsonMapObject(w: *Writer, map: std.StringHashMap(json.Value)) !void {
         try json.Stringify.value(entry.value_ptr.*, .{}, w);
     }
     try w.writeByte('}');
+}
+
+fn putOwnedJsonEntry(
+    allocator: Allocator,
+    obj: *json.ObjectMap,
+    key: []const u8,
+    value: json.Value,
+) !void {
+    if (obj.fetchOrderedRemove(key)) |kv| {
+        allocator.free(@constCast(kv.key));
+        var old = kv.value;
+        scope_mod.deinitJsonValueDeep(allocator, &old);
+    }
+
+    const key_copy = try allocator.dupe(u8, key);
+    errdefer allocator.free(key_copy);
+
+    try obj.put(key_copy, value);
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -1004,4 +1073,51 @@ test "Span metadata setters serialize tags and data" {
     try testing.expect(std.mem.indexOf(u8, json_str, "\"rows\":1") != null);
     try testing.expect(std.mem.indexOf(u8, json_str, "\"op\":\"db.query.custom\"") != null);
     try testing.expect(std.mem.indexOf(u8, json_str, "\"description\":\"SELECT 1 /* custom */\"") != null);
+}
+
+test "Transaction setRequest serializes request object" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /request-meta",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    try txn.setRequest(.{
+        .method = "GET",
+        .url = "https://example.com/orders",
+        .query_string = "limit=10",
+        .cookies = "sid=abc",
+    });
+    txn.finish();
+
+    const json_str = try txn.toJson(testing.allocator);
+    defer testing.allocator.free(json_str);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"request\":{") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"method\":\"GET\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"url\":\"https://example.com/orders\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"query_string\":\"limit=10\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"cookies\":\"sid=abc\"") != null);
+}
+
+test "Span setRequest stores request details in span data" {
+    var txn = Transaction.init(testing.allocator, .{
+        .name = "GET /span-request",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+
+    const span = try txn.startChild(.{ .op = "http.client" });
+    try span.setRequest(.{
+        .method = "POST",
+        .url = "https://api.example.com/checkout",
+        .data = "{\"amount\":42}",
+    });
+    span.finish();
+    txn.finish();
+
+    const json_str = try txn.toJson(testing.allocator);
+    defer testing.allocator.free(json_str);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"method\":\"POST\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"url\":\"https://api.example.com/checkout\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json_str, "\"data\":\"{\\\"amount\\\":42}\"") != null);
 }

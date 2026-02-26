@@ -188,6 +188,14 @@ try timed_txn.setData("cache_hit", .{ .bool = true });
 try timed_txn.setOrigin("auto.http");
 try fixed_span.setTag("db.system", "postgresql");
 try fixed_span.setData("rows", .{ .integer = 1 });
+try timed_txn.setRequest(.{
+    .method = "POST",
+    .url = "https://api.example.com/orders",
+});
+try fixed_span.setRequest(.{
+    .method = "POST",
+    .url = "https://api.example.com/orders",
+});
 const trace_ctx = timed_txn.getTraceContext();
 const span_trace_header = try fixed_span.sentryTraceHeaderAlloc(allocator);
 defer allocator.free(span_trace_header);
