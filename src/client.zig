@@ -42,6 +42,7 @@ const DynamicSamplingContext = propagation.DynamicSamplingContext;
 const PropagationHeader = propagation.PropagationHeader;
 const Uuid = @import("uuid.zig").Uuid;
 const ts = @import("timestamp.zig");
+const breadcrumb_input = @import("breadcrumb_input.zig");
 
 const ExceptionFrameOwnership = struct {
     allocator: Allocator,
@@ -606,7 +607,7 @@ pub const Client = struct {
 
     /// Fallible variant of addBreadcrumb.
     pub fn tryAddBreadcrumb(self: *Client, crumbs: anytype) !void {
-        try self.tryAddBreadcrumbInput(crumbs);
+        try breadcrumb_input.forEach(crumbs, self, applyBreadcrumbInput);
     }
 
     fn tryAddSingleBreadcrumb(self: *Client, crumb: Breadcrumb) !void {
@@ -619,80 +620,8 @@ pub const Client = struct {
         try self.scope.tryAddBreadcrumb(crumb);
     }
 
-    fn breadcrumbFromStruct(value: anytype) Breadcrumb {
-        const T = @TypeOf(value);
-        const struct_info = switch (@typeInfo(T)) {
-            .@"struct" => |info| info,
-            else => @compileError("Breadcrumb struct conversion requires a struct input."),
-        };
-
-        var crumb = Breadcrumb{};
-        inline for (struct_info.fields) |field| {
-            if (!@hasField(Breadcrumb, field.name)) {
-                @compileError("Unsupported breadcrumb field.");
-            }
-            @field(crumb, field.name) = @field(value, field.name);
-        }
-        return crumb;
-    }
-
-    fn tryAddBreadcrumbInput(self: *Client, crumbs: anytype) !void {
-        const T = @TypeOf(crumbs);
-        switch (@typeInfo(T)) {
-            .optional => {
-                if (crumbs) |crumb| {
-                    try self.tryAddBreadcrumbInput(crumb);
-                }
-                return;
-            },
-            .@"struct" => {
-                const crumb = breadcrumbFromStruct(crumbs);
-                try self.tryAddSingleBreadcrumb(crumb);
-                return;
-            },
-            .array => {
-                for (crumbs) |crumb| {
-                    try self.tryAddBreadcrumbInput(crumb);
-                }
-                return;
-            },
-            .pointer => |ptr| {
-                if (ptr.size == .slice) {
-                    for (crumbs) |crumb| {
-                        try self.tryAddBreadcrumbInput(crumb);
-                    }
-                    return;
-                }
-                if (ptr.size == .one) {
-                    switch (@typeInfo(ptr.child)) {
-                        .@"fn" => {
-                            const produced = crumbs();
-                            try self.tryAddBreadcrumbInput(produced);
-                            return;
-                        },
-                        .array => {
-                            for (crumbs.*) |crumb| {
-                                try self.tryAddBreadcrumbInput(crumb);
-                            }
-                            return;
-                        },
-                        else => {
-                            const crumb = breadcrumbFromStruct(crumbs.*);
-                            try self.tryAddSingleBreadcrumb(crumb);
-                            return;
-                        },
-                    }
-                }
-            },
-            .@"fn" => {
-                const produced = crumbs();
-                try self.tryAddBreadcrumbInput(produced);
-                return;
-            },
-            else => {},
-        }
-
-        @compileError("Unsupported breadcrumb input type.");
+    fn applyBreadcrumbInput(self: *Client, crumb: Breadcrumb) !void {
+        try self.tryAddSingleBreadcrumb(crumb);
     }
 
     /// Clear all breadcrumbs from the scope.
