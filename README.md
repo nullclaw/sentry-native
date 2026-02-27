@@ -112,7 +112,7 @@ jobs:
 - `Client`: owns transport, worker queue, and runtime configuration.
 - `Scope`: mutable event context (user, tags, extras, breadcrumbs, attachments).
 - `Hub`: scope stack + thread-local current hub API for scoped captures.
-- Global helpers via current Hub: `captureMessage`, `captureException`, `captureCheckIn`, `startSession`, `endSession`, `flush`, `close`, `addBreadcrumb`, `pushScope`, `configureScope`, `withIntegration`.
+- Global helpers via current Hub: `captureMessage`, `captureException`, `captureError`, `captureCheckIn`, `startSession`, `endSession`, `flush`, `close`, `addBreadcrumb`, `pushScope`, `configureScope`, `withIntegration`.
 - `Event`: error/message payload (`captureMessage`, `captureException`, `captureEvent`).
 - `Transaction` + `Span`: tracing payloads (`startTransaction`, `finishTransaction`).
 - `Session`: release health lifecycle (`startSession`, `endSession`).
@@ -157,6 +157,9 @@ client.captureMessage("checkout failed", .err);
 
 // Capture exception
 client.captureException("PaymentError", "gateway timeout");
+
+// Capture Zig error value
+client.captureError(error.PaymentGatewayTimeout);
 
 // Get event id when accepted
 if (client.captureMessageId("degraded mode", .warning)) |event_id| {

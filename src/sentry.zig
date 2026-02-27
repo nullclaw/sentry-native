@@ -159,6 +159,11 @@ pub fn captureException(exception_type: []const u8, value: []const u8) ?[32]u8 {
     return hub.captureExceptionId(exception_type, value);
 }
 
+pub fn captureError(err: anyerror) ?[32]u8 {
+    const hub = Hub.current() orelse return null;
+    return hub.captureErrorId(err);
+}
+
 pub fn captureLog(entry: *const LogEntry) bool {
     const hub = Hub.current() orelse return false;
     hub.captureLog(entry);
@@ -330,6 +335,7 @@ test "global wrappers are safe no-op without current hub" {
     try std.testing.expect(currentHub() == null);
     try std.testing.expect(captureMessage("no-hub", .info) == null);
     try std.testing.expect(captureException("TypeError", "no-hub") == null);
+    try std.testing.expect(captureError(error.NoHubErrorParity) == null);
     try std.testing.expect(!captureLogMessage("no-hub", .info));
     var check_in = MonitorCheckIn.init("no-hub", .in_progress);
     try std.testing.expect(!captureCheckIn(&check_in));
@@ -428,6 +434,11 @@ test "global wrappers route through current hub" {
     try std.testing.expect(event_id != null);
     try std.testing.expectEqualSlices(u8, &event_id.?, &client.lastEventId().?);
     try std.testing.expectEqualSlices(u8, &event_id.?, &lastEventId().?);
+
+    const error_event_id = captureError(error.GlobalErrorParity);
+    try std.testing.expect(error_event_id != null);
+    try std.testing.expectEqualSlices(u8, &error_event_id.?, &client.lastEventId().?);
+    try std.testing.expectEqualSlices(u8, &error_event_id.?, &lastEventId().?);
 
     try std.testing.expect(captureLogMessage("global-log", .warn));
     var check_in = MonitorCheckIn.init("global-check-in", .in_progress);

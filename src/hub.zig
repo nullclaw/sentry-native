@@ -308,6 +308,14 @@ pub const Hub = struct {
         return self.captureEventId(&event);
     }
 
+    pub fn captureError(self: *Hub, err: anyerror) void {
+        _ = self.captureErrorId(err);
+    }
+
+    pub fn captureErrorId(self: *Hub, err: anyerror) ?[32]u8 {
+        return self.captureExceptionId("ZigError", @errorName(err));
+    }
+
     pub fn captureCheckIn(self: *Hub, check_in: *const MonitorCheckIn) void {
         self.client.captureCheckIn(check_in);
     }
@@ -575,7 +583,9 @@ test "Hub capture uses hub scope stack data" {
     try hub.tryAddEventProcessor(dropEvent);
 
     try testing.expect(hub.captureMessageId("dropped-by-hub-scope", .err) == null);
+    try testing.expect(hub.captureErrorId(error.HubScopeDropParity) == null);
     try testing.expect(client.captureMessageId("accepted-by-client-scope", .err) != null);
+    try testing.expect(client.captureErrorId(error.HubScopeClientParity) != null);
 }
 
 test "Hub addBreadcrumb applies client before_breadcrumb callback" {

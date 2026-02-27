@@ -590,6 +590,7 @@ test "CJM e2e: full flow captures event transaction log session and check-in" {
     client.startSession();
     client.captureMessage("full-flow-message", .warning);
     client.captureException("CheckoutError", "payment provider timeout");
+    client.captureError(error.CheckoutGatewayTimedOut);
 
     var txn = client.startTransaction(.{
         .name = "POST /checkout-full-flow",
@@ -624,6 +625,7 @@ test "CJM e2e: full flow captures event transaction log session and check-in" {
 
     try testing.expect(relay.containsInAny("\"full-flow-message\""));
     try testing.expect(relay.containsInAny("\"CheckoutError\""));
+    try testing.expect(relay.containsInAny("\"CheckoutGatewayTimedOut\""));
     try testing.expect(relay.containsInAny("\"transaction\":\"POST /checkout-full-flow\""));
     try testing.expect(relay.containsInAny("\"body\":\"full-flow-log\""));
     try testing.expect(relay.containsInAny("\"monitor_slug\":\"checkout-full-flow-cron\""));

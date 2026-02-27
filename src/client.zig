@@ -285,6 +285,16 @@ pub const Client = struct {
         return self.captureEventId(&event);
     }
 
+    /// Capture a Zig `anyerror` value as an exception event.
+    pub fn captureError(self: *Client, err: anyerror) void {
+        _ = self.captureErrorId(err);
+    }
+
+    /// Capture a Zig `anyerror` value and return its id if accepted.
+    pub fn captureErrorId(self: *Client, err: anyerror) ?[32]u8 {
+        return self.captureExceptionId("ZigError", @errorName(err));
+    }
+
     /// Capture a monitor check-in envelope.
     pub fn captureCheckIn(self: *Client, check_in: *const MonitorCheckIn) void {
         if (!self.isEnabled()) return;
@@ -4228,6 +4238,30 @@ test "Client captureMessageId returns null when before_send drops event" {
 
     try testing.expect(client.captureMessageId("drop-me", .info) == null);
     try testing.expect(client.lastEventId() == null);
+}
+
+test "Client captureErrorId serializes Zig error names" {
+    var state = PayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .transport = .{
+            .send_fn = payloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const event_id = client.captureErrorId(error.CaptureErrorParity);
+    try testing.expect(event_id != null);
+    try testing.expect(client.flush(1000));
+    try testing.expectEqual(@as(usize, 1), state.sent_count);
+    try testing.expect(state.last_payload != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"type\":\"event\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"type\":\"ZigError\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"value\":\"CaptureErrorParity\"") != null);
 }
 
 test "Client close shuts down worker and disables client" {

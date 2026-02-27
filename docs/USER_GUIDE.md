@@ -157,6 +157,7 @@ fn setupIntegration(client: *sentry.Client, _: ?*anyopaque) void {
 ```zig
 client.captureMessage("checkout failed", .err);
 client.captureException("PaymentError", "gateway timeout");
+client.captureError(error.PaymentGatewayTimeout);
 ```
 
 ### Get `event_id`
@@ -241,6 +242,7 @@ TLS helper methods:
 After `setCurrentHub`, you can use global helper calls:
 - `sentry.captureMessage(...)`
 - `sentry.captureException(...)`
+- `sentry.captureError(...)`
 - `sentry.captureCheckIn(...)`
 - `sentry.startSession()` / `sentry.endSession(...)`
 - `sentry.lastEventId()`
