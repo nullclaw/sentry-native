@@ -423,6 +423,7 @@ defer txn_from_traceparent.deinit();
 // Built-in transport backend composition
 var file_backend = try sentry.transport_backends.file.Backend.init(allocator, .{
     .directory = "/var/tmp/sentry-outbox",
+    .failure_backoff_seconds = 1,
 });
 defer file_backend.deinit();
 const file_transport = file_backend.transportConfig();
@@ -438,6 +439,9 @@ const client = try sentry.init(allocator, .{
     .transport = fanout_backend.transportConfig(),
 });
 defer client.deinit();
+
+const backend_stats = file_backend.stats();
+_ = backend_stats;
 ```
 
 ```zig

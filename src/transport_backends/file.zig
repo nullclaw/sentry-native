@@ -3,11 +3,18 @@ const testing = std.testing;
 
 const TransportConfig = @import("../client.zig").TransportConfig;
 const SendOutcome = @import("../worker.zig").SendOutcome;
+const RateLimitUpdate = @import("../ratelimit.zig").Update;
 
 pub const Options = struct {
     directory: []const u8,
     prefix: []const u8 = "sentry-envelope",
     extension: []const u8 = "envelope",
+    failure_backoff_seconds: ?u64 = 1,
+};
+
+pub const Stats = struct {
+    written_files: u64,
+    write_failures: u64,
 };
 
 /// File-based transport backend.
@@ -19,8 +26,11 @@ pub const Backend = struct {
     directory: []u8,
     prefix: []u8,
     extension: []u8,
+    failure_backoff_seconds: ?u64,
     mutex: std.Thread.Mutex = .{},
     counter: u64 = 0,
+    written_files: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    write_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !Backend {
         try std.fs.cwd().makePath(options.directory);
@@ -36,6 +46,7 @@ pub const Backend = struct {
             .directory = directory,
             .prefix = prefix,
             .extension = extension,
+            .failure_backoff_seconds = options.failure_backoff_seconds,
         };
     }
 
@@ -53,9 +64,24 @@ pub const Backend = struct {
         };
     }
 
+    pub fn stats(self: *const Backend) Stats {
+        return .{
+            .written_files = self.written_files.load(.monotonic),
+            .write_failures = self.write_failures.load(.monotonic),
+        };
+    }
+
     fn sendFn(data: []const u8, ctx: ?*anyopaque) SendOutcome {
         const self: *Backend = @ptrCast(@alignCast(ctx.?));
-        self.writeEnvelopeFile(data) catch {};
+        self.writeEnvelopeFile(data) catch {
+            _ = self.write_failures.fetchAdd(1, .monotonic);
+            var update: RateLimitUpdate = .{};
+            if (self.failure_backoff_seconds) |seconds| {
+                if (seconds > 0) update.setMax(.any, seconds);
+            }
+            return .{ .rate_limits = update };
+        };
+        _ = self.written_files.fetchAdd(1, .monotonic);
         return .{};
     }
 
@@ -128,4 +154,32 @@ test "file backend writes envelopes to configured directory" {
     try testing.expectEqual(@as(usize, 2), file_count);
     try testing.expect(saw_first);
     try testing.expect(saw_second);
+    const stats = backend.stats();
+    try testing.expectEqual(@as(u64, 2), stats.written_files);
+    try testing.expectEqual(@as(u64, 0), stats.write_failures);
+}
+
+test "file backend reports failures with optional backoff and stats" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const dir_path = try std.fs.path.join(testing.allocator, &.{ ".zig-cache/tmp", tmp.sub_path });
+    defer testing.allocator.free(dir_path);
+
+    var backend = try Backend.init(testing.allocator, .{
+        .directory = dir_path,
+        .failure_backoff_seconds = 3,
+    });
+    defer backend.deinit();
+
+    // Force createFile failure after successful init.
+    try std.fs.cwd().deleteTree(dir_path);
+
+    const transport = backend.transportConfig();
+    const outcome = transport.send_fn("envelope-fail", transport.ctx);
+    try testing.expectEqual(@as(?u64, 3), outcome.rate_limits.any);
+
+    const stats = backend.stats();
+    try testing.expectEqual(@as(u64, 0), stats.written_files);
+    try testing.expectEqual(@as(u64, 1), stats.write_failures);
 }

@@ -1238,6 +1238,49 @@ test "runIncomingRequestFromHeaders continues trace from traceparent when sentry
     try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "0123456789abcdef0123456789abcdef") != null);
 }
 
+test "runIncomingRequestFromHeaders accepts future traceparent versions" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const headers = [_]PropagationHeader{
+        .{
+            .name = "traceparent",
+            .value = "01-0123456789abcdef0123456789abcdef-89abcdef01234567-01-extra",
+        },
+    };
+
+    var state = IncomingHandlerSuccessState{};
+    const status_code = try runIncomingRequestFromHeaders(
+        testing.allocator,
+        client,
+        .{
+            .name = "GET /pipeline-traceparent-future",
+            .method = "GET",
+            .url = "https://api.example.com/pipeline-traceparent-future",
+        },
+        &headers,
+        incomingHandlerSuccess,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 204), status_code);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 1);
+    try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "0123456789abcdef0123456789abcdef") != null);
+}
+
 test "RequestContext finish adds HTTP breadcrumb with request metadata" {
     var payload_state = PayloadState{ .allocator = testing.allocator };
     defer payload_state.deinit();

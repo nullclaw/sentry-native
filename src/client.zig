@@ -43,6 +43,7 @@ const PropagationHeader = propagation.PropagationHeader;
 const Uuid = @import("uuid.zig").Uuid;
 const ts = @import("timestamp.zig");
 const breadcrumb_input = @import("breadcrumb_input.zig");
+const debug_meta_mod = @import("debug_meta.zig");
 
 const ExceptionFrameOwnership = struct {
     allocator: Allocator,
@@ -165,6 +166,8 @@ pub const Client = struct {
     log_batch_shutdown: bool = false,
     log_batch_thread: ?std.Thread = null,
     owned_integrations: ?[]Integration = null,
+    debug_image_code_file: ?[]u8 = null,
+    debug_image_code_file_cached: bool = false,
 
     /// Initialize a new Client. Heap-allocates the Client struct so that
     /// internal pointers (e.g., the Worker's send_ctx) remain stable.
@@ -219,7 +222,13 @@ pub const Client = struct {
             .session = null,
             .last_event_id = null,
             .owned_integrations = owned_integrations,
+            .debug_image_code_file = null,
+            .debug_image_code_file_cached = false,
         };
+
+        if (self.options.attach_debug_images) {
+            self.ensureDebugImageCodeFileCache();
+        }
 
         if (self.options.integrations) |integrations| {
             for (integrations) |integration| {
@@ -266,6 +275,7 @@ pub const Client = struct {
         if (self.default_server_name) |name| self.allocator.free(name);
         if (self.session_did) |did| self.allocator.free(did);
         if (self.owned_integrations) |values| self.allocator.free(values);
+        if (self.debug_image_code_file) |code_file| self.allocator.free(code_file);
         self.deinitSessionAggregates();
 
         const allocator = self.allocator;
@@ -484,13 +494,13 @@ pub const Client = struct {
 
         if (self.options.attach_debug_images) {
             if (prepared_event.debug_meta == null) {
-                const debug_meta = buildDefaultDebugMeta(self.allocator) catch null;
+                const debug_meta = self.buildDefaultDebugMeta(self.allocator) catch null;
                 if (debug_meta) |value| {
                     prepared_event.debug_meta = value;
                     owned_debug_meta = value;
                 }
             } else {
-                if (mergeDefaultDebugMeta(self.allocator, prepared_event) catch null) |value| {
+                if (self.mergeDefaultDebugMeta(self.allocator, prepared_event) catch null) |value| {
                     prepared_event.debug_meta = value;
                     owned_debug_meta = value;
                 }
@@ -1395,53 +1405,22 @@ pub const Client = struct {
         return .{ .object = threads_object };
     }
 
-    fn debugImageType() []const u8 {
-        return switch (builtin.object_format) {
-            .coff => "pe",
-            .elf => "elf",
-            .macho => "macho",
-            .wasm => "wasm",
-            else => "other",
-        };
+    fn ensureDebugImageCodeFileCache(self: *Client) void {
+        if (self.debug_image_code_file_cached) return;
+        self.debug_image_code_file_cached = true;
+        self.debug_image_code_file = debug_meta_mod.detectCodeFileAlloc(self.allocator);
     }
 
-    fn buildDefaultDebugMeta(allocator: Allocator) !json.Value {
-        var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const code_file = std.fs.selfExePath(&exe_path_buf) catch @tagName(builtin.os.tag);
-
-        var image_object = json.ObjectMap.init(allocator);
-        var image_moved = false;
-        errdefer if (!image_moved) {
-            var value: json.Value = .{ .object = image_object };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        };
-
-        try putOwnedString(allocator, &image_object, "type", debugImageType());
-        try putOwnedString(allocator, &image_object, "code_file", code_file);
-
-        var images_array = json.Array.init(allocator);
-        var images_moved = false;
-        errdefer if (!images_moved) {
-            var value: json.Value = .{ .array = images_array };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        };
-
-        try images_array.append(.{ .object = image_object });
-        image_moved = true;
-
-        var debug_meta_object = json.ObjectMap.init(allocator);
-        errdefer {
-            var value: json.Value = .{ .object = debug_meta_object };
-            scope_mod.deinitJsonValueDeep(allocator, &value);
-        }
-
-        try putOwnedJsonEntry(allocator, &debug_meta_object, "images", .{ .array = images_array });
-        images_moved = true;
-
-        return .{ .object = debug_meta_object };
+    fn defaultDebugImageCodeFile(self: *Client) []const u8 {
+        self.ensureDebugImageCodeFileCache();
+        return self.debug_image_code_file orelse @tagName(builtin.os.tag);
     }
 
-    fn mergeDefaultDebugMeta(allocator: Allocator, event: *Event) !?json.Value {
+    fn buildDefaultDebugMeta(self: *Client, allocator: Allocator) !json.Value {
+        return debug_meta_mod.buildDefault(allocator, self.defaultDebugImageCodeFile());
+    }
+
+    fn mergeDefaultDebugMeta(self: *Client, allocator: Allocator, event: *Event) !?json.Value {
         const debug_meta = event.debug_meta orelse return null;
         if (debug_meta != .object) return null;
         if (debug_meta.object.get("images") != null) return null;
@@ -1450,7 +1429,7 @@ pub const Client = struct {
         errdefer scope_mod.deinitJsonValueDeep(allocator, &merged);
         if (merged != .object) return null;
 
-        const defaults = try buildDefaultDebugMeta(allocator);
+        const defaults = try self.buildDefaultDebugMeta(allocator);
         defer {
             var defaults_owned = defaults;
             scope_mod.deinitJsonValueDeep(allocator, &defaults_owned);

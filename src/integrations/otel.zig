@@ -46,10 +46,12 @@ pub fn parseTraceParent(traceparent: []const u8) ?TraceParentContext {
     const trace_id_text = it.next() orelse return null;
     const span_id_text = it.next() orelse return null;
     const flags_text = it.next() orelse return null;
-    if (it.next() != null) return null;
 
     if (version.len != 2 or trace_id_text.len != 32 or span_id_text.len != 16 or flags_text.len != 2) return null;
+    _ = parseHexNibble(version[0]) orelse return null;
+    _ = parseHexNibble(version[1]) orelse return null;
     if (std.ascii.eqlIgnoreCase(version, "ff")) return null;
+    if (std.mem.eql(u8, version, "00") and it.next() != null) return null;
     if (isAllZeros(trace_id_text) or isAllZeros(span_id_text)) return null;
 
     var trace_id: [32]u8 = undefined;
@@ -149,6 +151,14 @@ test "parseTraceParent rejects malformed input" {
     try testing.expect(parseTraceParent("00-00000000000000000000000000000000-89abcdef01234567-01") == null);
     try testing.expect(parseTraceParent("00-0123456789abcdef0123456789abcdef-0000000000000000-01") == null);
     try testing.expect(parseTraceParent("ff-0123456789abcdef0123456789abcdef-89abcdef01234567-01") == null);
+    try testing.expect(parseTraceParent("zz-0123456789abcdef0123456789abcdef-89abcdef01234567-01") == null);
+}
+
+test "parseTraceParent accepts future versions with trailing data" {
+    const parsed = parseTraceParent("01-0123456789abcdef0123456789abcdef-89abcdef01234567-01-extra").?;
+    try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", parsed.trace_id[0..]);
+    try testing.expectEqualStrings("89abcdef01234567", parsed.parent_span_id[0..]);
+    try testing.expectEqual(@as(?bool, true), parsed.sampled);
 }
 
 test "parseTraceParent normalizes uppercase identifiers to lowercase" {

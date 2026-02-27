@@ -83,10 +83,36 @@ fn capture(msg: []const u8, return_address: ?usize) void {
             }
         }
         if (!attempted_enriched_capture) {
-            _ = hub.captureExceptionId(cfg.exception_type, msg);
+            _ = captureFatalException(hub, cfg.exception_type, msg);
         }
         _ = hub.flush(cfg.flush_timeout_ms);
     }
+}
+
+fn captureFatalException(hub: *Hub, exception_type: []const u8, value: []const u8) ?[32]u8 {
+    const values = [_]ExceptionValue{.{
+        .type = exception_type,
+        .value = value,
+    }};
+    var event = Event.initException(&values);
+    event.level = .fatal;
+    return hub.captureEventId(&event);
+}
+
+fn captureFatalExceptionWithFrames(
+    hub: *Hub,
+    exception_type: []const u8,
+    value: []const u8,
+    frames: []const Frame,
+) ?[32]u8 {
+    const values = [_]ExceptionValue{.{
+        .type = exception_type,
+        .value = value,
+        .stacktrace = Stacktrace{ .frames = frames },
+    }};
+    var event = Event.initException(&values);
+    event.level = .fatal;
+    return hub.captureEventId(&event);
 }
 
 fn captureWithBacktrace(
@@ -102,7 +128,7 @@ fn captureWithBacktrace(
         if (allow_return_address_fallback) {
             return captureWithReturnAddressFrame(hub, exception_type, value, return_address);
         }
-        return hub.captureExceptionId(exception_type, value);
+        return captureFatalException(hub, exception_type, value);
     }
 
     var iterator = std.debug.StackIterator.init(return_address, null);
@@ -124,19 +150,9 @@ fn captureWithBacktrace(
         if (allow_return_address_fallback) {
             return captureWithReturnAddressFrame(hub, exception_type, value, return_address);
         }
-        return hub.captureExceptionId(exception_type, value);
+        return captureFatalException(hub, exception_type, value);
     }
-
-    const values = [_]ExceptionValue{.{
-        .type = exception_type,
-        .value = value,
-        .stacktrace = Stacktrace{
-            .frames = frames[0..frame_count],
-        },
-    }};
-    var event = Event.initException(&values);
-    event.level = .fatal;
-    return hub.captureEventId(&event);
+    return captureFatalExceptionWithFrames(hub, exception_type, value, frames[0..frame_count]);
 }
 
 fn captureWithReturnAddressFrame(
@@ -147,20 +163,8 @@ fn captureWithReturnAddressFrame(
 ) ?[32]u8 {
     var address_buf: [2 + (@sizeOf(usize) * 2)]u8 = undefined;
     const address = std.fmt.bufPrint(&address_buf, "0x{x}", .{return_address}) catch null;
-
-    const frames = [_]Frame{.{
-        .instruction_addr = address,
-    }};
-    const values = [_]ExceptionValue{.{
-        .type = exception_type,
-        .value = value,
-        .stacktrace = Stacktrace{
-            .frames = &frames,
-        },
-    }};
-    var event = Event.initException(&values);
-    event.level = .fatal;
-    return hub.captureEventId(&event);
+    const frames = [_]Frame{.{ .instruction_addr = address }};
+    return captureFatalExceptionWithFrames(hub, exception_type, value, &frames);
 }
 
 const PayloadState = struct {
@@ -212,6 +216,7 @@ test "panic integration captures panic message through current hub" {
     try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "\"type\":\"event\"") != null);
     try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "\"ZigPanic\"") != null);
     try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "panic parity test") != null);
+    try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "\"level\":\"fatal\"") != null);
 }
 
 test "panic integration can attach return-address frame as stacktrace" {
@@ -279,4 +284,37 @@ test "panic integration can capture multi-frame backtrace" {
     try testing.expect(payload_state.payloads.items.len >= 1);
     try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "\"stacktrace\"") != null);
     try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "\"instruction_addr\":\"0x") != null);
+}
+
+test "panic integration fallback capture is fatal when no stack capture is configured" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    defer _ = Hub.clearCurrent();
+    _ = Hub.setCurrent(&hub);
+
+    install(.{
+        .exception_type = "ZigPanic",
+        .flush_timeout_ms = 1000,
+        .capture_backtrace = false,
+        .capture_return_address_frame = false,
+    });
+    defer reset();
+
+    capture("panic fatal fallback", null);
+
+    try testing.expect(payload_state.payloads.items.len >= 1);
+    try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "\"level\":\"fatal\"") != null);
 }
