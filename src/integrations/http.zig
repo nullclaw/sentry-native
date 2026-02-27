@@ -108,8 +108,15 @@ pub const RequestContext = struct {
     ) !RequestContext {
         var merged_options = options;
         const extracted = extractIncomingPropagationHeaders(headers);
+        var sentry_trace_from_traceparent: [51]u8 = undefined;
         if (merged_options.sentry_trace_header == null) {
-            merged_options.sentry_trace_header = extracted.sentry_trace_header;
+            if (extracted.sentry_trace_header) |header| {
+                merged_options.sentry_trace_header = header;
+            } else if (extracted.traceparent_header) |traceparent| {
+                if (sentryTraceFromTraceParent(traceparent, &sentry_trace_from_traceparent)) |converted| {
+                    merged_options.sentry_trace_header = converted;
+                }
+            }
         }
         if (merged_options.baggage_header == null) {
             merged_options.baggage_header = extracted.baggage_header;
@@ -210,6 +217,22 @@ pub const PropagationHeaderList = struct {
     }
 };
 
+pub const PropagationHeaderListWithTraceParent = struct {
+    headers: [3]PropagationHeader,
+    owned: PropagationHeaders,
+    traceparent: []u8,
+
+    pub fn deinit(self: *PropagationHeaderListWithTraceParent, allocator: std.mem.Allocator) void {
+        self.owned.deinit(allocator);
+        allocator.free(self.traceparent);
+        self.* = undefined;
+    }
+
+    pub fn slice(self: *const PropagationHeaderListWithTraceParent) []const PropagationHeader {
+        return self.headers[0..];
+    }
+};
+
 /// Outbound request instrumentation context.
 ///
 /// Requires an active current Hub with a bound transaction/span. `begin` creates
@@ -305,6 +328,49 @@ pub const OutgoingRequestContext = struct {
         };
     }
 
+    /// Build `traceparent` (W3C Trace Context) header value from current span.
+    pub fn traceParentHeaderAlloc(self: *OutgoingRequestContext, allocator: std.mem.Allocator) ![]u8 {
+        return std.fmt.allocPrint(
+            allocator,
+            "00-{s}-{s}-{s}",
+            .{
+                self.span.trace_id[0..],
+                self.span.span_id[0..],
+                if (self.span.sampled) "01" else "00",
+            },
+        );
+    }
+
+    /// Build standard outgoing header triplet:
+    /// `sentry-trace`, `baggage`, and W3C `traceparent`.
+    pub fn propagationHeaderListWithTraceParentAlloc(
+        self: *OutgoingRequestContext,
+        allocator: std.mem.Allocator,
+    ) !PropagationHeaderListWithTraceParent {
+        const owned = try self.propagationHeadersAlloc(allocator);
+        errdefer owned.deinit(allocator);
+
+        const traceparent = try self.traceParentHeaderAlloc(allocator);
+        return .{
+            .headers = .{
+                .{
+                    .name = "sentry-trace",
+                    .value = owned.sentry_trace,
+                },
+                .{
+                    .name = "baggage",
+                    .value = owned.baggage,
+                },
+                .{
+                    .name = "traceparent",
+                    .value = traceparent,
+                },
+            },
+            .owned = owned,
+            .traceparent = traceparent,
+        };
+    }
+
     pub fn finish(self: *OutgoingRequestContext, status_code_override: ?u16) void {
         if (self.finished) return;
 
@@ -363,6 +429,7 @@ pub const IncomingRunOptions = struct {
 pub const IncomingPropagationHeaders = struct {
     sentry_trace_header: ?[]const u8 = null,
     baggage_header: ?[]const u8 = null,
+    traceparent_header: ?[]const u8 = null,
 };
 
 /// Extract `sentry-trace` and `baggage` values from case-insensitive header
@@ -377,9 +444,66 @@ pub fn extractIncomingPropagationHeaders(headers: []const PropagationHeader) Inc
         }
         if (result.baggage_header == null and std.ascii.eqlIgnoreCase(name, "baggage")) {
             result.baggage_header = header.value;
+            continue;
+        }
+        if (result.traceparent_header == null and std.ascii.eqlIgnoreCase(name, "traceparent")) {
+            result.traceparent_header = header.value;
         }
     }
     return result;
+}
+
+fn parseHexNibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+fn parseHexByte(two_hex_chars: []const u8) ?u8 {
+    if (two_hex_chars.len != 2) return null;
+    const hi = parseHexNibble(two_hex_chars[0]) orelse return null;
+    const lo = parseHexNibble(two_hex_chars[1]) orelse return null;
+    return (hi << 4) | lo;
+}
+
+fn isAllZeros(slice: []const u8) bool {
+    for (slice) |value| {
+        if (value != '0') return false;
+    }
+    return true;
+}
+
+fn sentryTraceFromTraceParent(traceparent: []const u8, output: *[51]u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, traceparent, " \t");
+    var it = std.mem.splitScalar(u8, trimmed, '-');
+
+    const version = it.next() orelse return null;
+    const trace_id = it.next() orelse return null;
+    const span_id = it.next() orelse return null;
+    const flags = it.next() orelse return null;
+    if (it.next() != null) return null;
+
+    if (version.len != 2 or trace_id.len != 32 or span_id.len != 16 or flags.len != 2) return null;
+    if (isAllZeros(trace_id) or isAllZeros(span_id)) return null;
+
+    for (trace_id) |c| {
+        _ = parseHexNibble(c) orelse return null;
+    }
+    for (span_id) |c| {
+        _ = parseHexNibble(c) orelse return null;
+    }
+    const flags_value = parseHexByte(flags) orelse return null;
+    const sampled: u8 = if ((flags_value & 1) != 0) '1' else '0';
+
+    @memcpy(output[0..32], trace_id);
+    output[32] = '-';
+    @memcpy(output[33..49], span_id);
+    output[49] = '-';
+    output[50] = sampled;
+    return output[0..];
 }
 
 /// Run an incoming HTTP handler inside `RequestContext` lifecycle.
@@ -705,6 +829,76 @@ test "OutgoingRequestContext propagationHeaderListAlloc returns standard header 
     try testing.expect(std.mem.indexOf(u8, headers[1].value, "sentry-trace_id=") != null);
 }
 
+test "OutgoingRequestContext traceParentHeaderAlloc produces valid w3c traceparent header" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    var txn = hub.startTransaction(.{
+        .name = "GET /traceparent",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+    hub.setSpan(.{ .transaction = &txn });
+
+    var out = try OutgoingRequestContext.begin(.{
+        .method = "GET",
+        .url = "https://downstream.example.com/traceparent",
+    });
+    defer out.deinit();
+
+    const traceparent = try out.traceParentHeaderAlloc(testing.allocator);
+    defer testing.allocator.free(traceparent);
+    try testing.expect(std.mem.startsWith(u8, traceparent, "00-"));
+    try testing.expect(std.mem.indexOf(u8, traceparent, txn.trace_id[0..]) != null);
+    try testing.expect(std.mem.indexOf(u8, traceparent, out.span.span_id[0..]) != null);
+}
+
+test "OutgoingRequestContext propagationHeaderListWithTraceParentAlloc returns three headers" {
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    var txn = hub.startTransaction(.{
+        .name = "GET /traceparent-list",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+    hub.setSpan(.{ .transaction = &txn });
+
+    var out = try OutgoingRequestContext.begin(.{
+        .method = "GET",
+        .url = "https://downstream.example.com/traceparent-list",
+    });
+    defer out.deinit();
+
+    var list = try out.propagationHeaderListWithTraceParentAlloc(testing.allocator);
+    defer list.deinit(testing.allocator);
+
+    const headers = list.slice();
+    try testing.expectEqual(@as(usize, 3), headers.len);
+    try testing.expectEqualStrings("sentry-trace", headers[0].name);
+    try testing.expectEqualStrings("baggage", headers[1].name);
+    try testing.expectEqualStrings("traceparent", headers[2].name);
+    try testing.expect(std.mem.startsWith(u8, headers[2].value, "00-"));
+}
+
 test "OutgoingRequestContext fail captures error and defaults HTTP status to 500" {
     var payload_state = PayloadState{ .allocator = testing.allocator };
     defer payload_state.deinit();
@@ -877,16 +1071,22 @@ test "extractIncomingPropagationHeaders reads case-insensitive sentry headers" {
             .name = "BAGGAGE",
             .value = "sentry-trace_id=0123456789abcdef0123456789abcdef,sentry-sampled=true",
         },
+        .{
+            .name = "TrAcEpArEnT",
+            .value = "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01",
+        },
     };
 
     const extracted = extractIncomingPropagationHeaders(&headers);
     try testing.expect(extracted.sentry_trace_header != null);
     try testing.expect(extracted.baggage_header != null);
+    try testing.expect(extracted.traceparent_header != null);
     try testing.expectEqualStrings(
         "0123456789abcdef0123456789abcdef-89abcdef01234567-1",
         extracted.sentry_trace_header.?,
     );
     try testing.expect(std.mem.indexOf(u8, extracted.baggage_header.?, "sentry-trace_id=") != null);
+    try testing.expect(std.mem.startsWith(u8, extracted.traceparent_header.?, "00-"));
 }
 
 test "runIncomingRequestFromHeaders continues trace using extracted sentry-trace header" {
@@ -934,6 +1134,53 @@ test "runIncomingRequestFromHeaders continues trace using extracted sentry-trace
     try testing.expect(client.flush(1000));
     try testing.expect(payload_state.payloads.items.len >= 1);
     try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "fedcba9876543210fedcba9876543210") != null);
+}
+
+test "runIncomingRequestFromHeaders continues trace from traceparent when sentry-trace is missing" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const headers = [_]PropagationHeader{
+        .{
+            .name = "traceparent",
+            .value = "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01",
+        },
+        .{
+            .name = "baggage",
+            .value = "sentry-trace_id=0123456789abcdef0123456789abcdef,sentry-sampled=true",
+        },
+    };
+
+    var state = IncomingHandlerSuccessState{};
+    const status_code = try runIncomingRequestFromHeaders(
+        testing.allocator,
+        client,
+        .{
+            .name = "GET /pipeline-traceparent",
+            .method = "GET",
+            .url = "https://api.example.com/pipeline-traceparent",
+        },
+        &headers,
+        incomingHandlerSuccess,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 204), status_code);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 1);
+    try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "0123456789abcdef0123456789abcdef") != null);
 }
 
 test "runIncomingRequest captures handler errors and marks transaction as internal_error" {

@@ -288,6 +288,7 @@ const status = try sentry.integrations.http.runIncomingRequestFromHeaders(
     .{},
 );
 _ = status;
+// traceparent is also supported when sentry-trace header is absent.
 ```
 
 ### Outgoing HTTP request integration helper
@@ -310,6 +311,10 @@ defer headers.deinit(allocator);
 var header_list = try out.propagationHeaderListAlloc(allocator);
 defer header_list.deinit(allocator);
 // header_list.slice() returns []sentry.PropagationHeader.
+
+var header_list_w3c = try out.propagationHeaderListWithTraceParentAlloc(allocator);
+defer header_list_w3c.deinit(allocator);
+// includes sentry-trace + baggage + traceparent.
 
 out.setStatusCode(200);
 out.finish(null);

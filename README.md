@@ -379,6 +379,7 @@ const status = try sentry.integrations.http.runIncomingRequestFromHeaders(
     .{},
 );
 _ = status;
+// If sentry-trace is missing, traceparent is also supported automatically.
 ```
 
 ```zig
@@ -397,6 +398,10 @@ defer headers.deinit(allocator);
 var header_list = try out.propagationHeaderListAlloc(allocator);
 defer header_list.deinit(allocator);
 // Or use header_list.slice() where []sentry.PropagationHeader is accepted.
+
+var header_list_w3c = try out.propagationHeaderListWithTraceParentAlloc(allocator);
+defer header_list_w3c.deinit(allocator);
+// Includes sentry-trace + baggage + traceparent.
 
 out.setStatusCode(200);
 out.finish(null);
