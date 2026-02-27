@@ -217,6 +217,26 @@ Error path:
 _ = req_ctx.fail(error.DatabaseTimeout, 500);
 ```
 
+Middleware-style handler execution helper:
+
+```zig
+const status = try sentry.integrations.http.runIncomingRequest(
+    allocator,
+    client,
+    .{
+        .name = "GET /orders/:id",
+        .method = "GET",
+        .url = "https://api.example.com/orders/42",
+        .sentry_trace_header = incoming_sentry_trace,
+        .baggage_header = incoming_baggage,
+    },
+    incomingHandler,
+    handler_ctx,
+    .{},
+);
+_ = status;
+```
+
 ### Outgoing HTTP request integration helper
 
 Use `integrations.http.OutgoingRequestContext` inside an active transaction/span
@@ -242,6 +262,21 @@ Error path:
 
 ```zig
 _ = out.fail(error.UpstreamTimeout, null); // defaults status_code to 500
+```
+
+Middleware-style outgoing helper:
+
+```zig
+const upstream_status = try sentry.integrations.http.runOutgoingRequest(
+    .{
+        .method = "POST",
+        .url = "https://payments.example.com/charge",
+    },
+    outgoingHandler,
+    handler_ctx,
+    .{},
+);
+_ = upstream_status;
 ```
 
 ### Error-return integration helper

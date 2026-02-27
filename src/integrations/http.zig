@@ -297,6 +297,76 @@ pub const OutgoingRequestContext = struct {
     }
 };
 
+pub const IncomingHandlerFn = *const fn (*RequestContext, ?*anyopaque) anyerror!u16;
+
+pub const IncomingRunOptions = struct {
+    error_status_code: ?u16 = 500,
+    capture_errors: bool = true,
+};
+
+/// Run an incoming HTTP handler inside `RequestContext` lifecycle.
+///
+/// The handler returns response status code. On success the transaction is
+/// finished with that status. On error the handler error is optionally captured
+/// and transaction finishes with `error_status_code`.
+pub fn runIncomingRequest(
+    allocator: std.mem.Allocator,
+    client: *Client,
+    request_options: RequestOptions,
+    handler: IncomingHandlerFn,
+    handler_ctx: ?*anyopaque,
+    run_options: IncomingRunOptions,
+) anyerror!u16 {
+    var request_context = try RequestContext.begin(allocator, client, request_options);
+    defer request_context.deinit();
+
+    const status_code = handler(&request_context, handler_ctx) catch |err| {
+        if (run_options.capture_errors) {
+            _ = request_context.fail(err, run_options.error_status_code);
+        } else {
+            request_context.finish(run_options.error_status_code);
+        }
+        return err;
+    };
+
+    request_context.finish(status_code);
+    return status_code;
+}
+
+pub const OutgoingHandlerFn = *const fn (*OutgoingRequestContext, ?*anyopaque) anyerror!u16;
+
+pub const OutgoingRunOptions = struct {
+    error_status_code: ?u16 = 500,
+    capture_errors: bool = true,
+};
+
+/// Run an outgoing HTTP operation inside `OutgoingRequestContext` lifecycle.
+///
+/// The handler returns upstream status code. On success the child span is
+/// finished with that status. On error the handler error is optionally captured
+/// and span finishes with `error_status_code`.
+pub fn runOutgoingRequest(
+    request_options: OutgoingRequestOptions,
+    handler: OutgoingHandlerFn,
+    handler_ctx: ?*anyopaque,
+    run_options: OutgoingRunOptions,
+) anyerror!u16 {
+    var request_context = try OutgoingRequestContext.begin(request_options);
+    defer request_context.deinit();
+
+    const status_code = handler(&request_context, handler_ctx) catch |err| {
+        if (run_options.capture_errors) {
+            _ = request_context.fail(err, run_options.error_status_code);
+        } else {
+            request_context.finish(run_options.error_status_code);
+        }
+        return err;
+    };
+
+    request_context.finish(status_code);
+    return status_code;
+}
+
 pub fn spanStatusFromHttpStatus(status_code: u16) SpanStatus {
     return switch (status_code) {
         401 => .unauthenticated,
@@ -572,4 +642,265 @@ test "OutgoingRequestContext begin requires current hub and active span" {
 
     try testing.expect(hub.getSpan() == null);
     try testing.expectError(error.NoActiveSpan, OutgoingRequestContext.begin(.{}));
+}
+
+const IncomingHandlerSuccessState = struct {
+    headers_seen: bool = false,
+};
+
+fn incomingHandlerSuccess(context: *RequestContext, ctx: ?*anyopaque) anyerror!u16 {
+    const state: *IncomingHandlerSuccessState = @ptrCast(@alignCast(ctx.?));
+    state.headers_seen = true;
+    context.setTag("handler", "incoming-success");
+    return 204;
+}
+
+fn incomingHandlerFailure(_: *RequestContext, _: ?*anyopaque) anyerror!u16 {
+    return error.IncomingPipelineFailure;
+}
+
+const OutgoingHandlerSuccessState = struct {
+    saw_trace_header: bool = false,
+    saw_baggage_header: bool = false,
+};
+
+fn outgoingHandlerSuccess(context: *OutgoingRequestContext, ctx: ?*anyopaque) anyerror!u16 {
+    const state: *OutgoingHandlerSuccessState = @ptrCast(@alignCast(ctx.?));
+    var headers = try context.propagationHeadersAlloc(testing.allocator);
+    defer headers.deinit(testing.allocator);
+
+    state.saw_trace_header = std.mem.indexOf(u8, headers.sentry_trace, "-") != null;
+    state.saw_baggage_header = std.mem.indexOf(u8, headers.baggage, "sentry-trace_id=") != null;
+    context.setTag("handler", "outgoing-success");
+    return 202;
+}
+
+fn outgoingHandlerFailure(_: *OutgoingRequestContext, _: ?*anyopaque) anyerror!u16 {
+    return error.OutgoingPipelineFailure;
+}
+
+test "runIncomingRequest auto-finishes transaction and captures handler data" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var state = IncomingHandlerSuccessState{};
+    const status_code = try runIncomingRequest(
+        testing.allocator,
+        client,
+        .{
+            .name = "GET /pipeline",
+            .method = "GET",
+            .url = "https://api.example.com/pipeline",
+        },
+        incomingHandlerSuccess,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 204), status_code);
+    try testing.expect(state.headers_seen);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 1);
+
+    var saw_transaction = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") != null) {
+            saw_transaction = true;
+            try testing.expect(std.mem.indexOf(u8, payload, "\"name\":\"GET /pipeline\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"status_code\":204") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"handler\":\"incoming-success\"") != null);
+        }
+    }
+    try testing.expect(saw_transaction);
+}
+
+test "runIncomingRequest captures handler errors and marks transaction as internal_error" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expectError(
+        error.IncomingPipelineFailure,
+        runIncomingRequest(
+            testing.allocator,
+            client,
+            .{
+                .name = "GET /pipeline-fail",
+                .method = "GET",
+                .url = "https://api.example.com/pipeline-fail",
+            },
+            incomingHandlerFailure,
+            null,
+            .{},
+        ),
+    );
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 2);
+
+    var saw_transaction = false;
+    var saw_error_event = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") != null) {
+            saw_transaction = true;
+            try testing.expect(std.mem.indexOf(u8, payload, "\"status\":\"internal_error\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"status_code\":500") != null);
+        }
+        if (std.mem.indexOf(u8, payload, "\"type\":\"event\"") != null and
+            std.mem.indexOf(u8, payload, "\"value\":\"IncomingPipelineFailure\"") != null)
+        {
+            saw_error_event = true;
+        }
+    }
+    try testing.expect(saw_transaction);
+    try testing.expect(saw_error_event);
+}
+
+test "runOutgoingRequest auto-finishes span and propagates headers" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    var txn = hub.startTransaction(.{
+        .name = "POST /checkout",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+    hub.setSpan(.{ .transaction = &txn });
+
+    var state = OutgoingHandlerSuccessState{};
+    const status_code = try runOutgoingRequest(
+        .{
+            .method = "POST",
+            .url = "https://payments.example.com/v1/charge",
+            .description = "POST payments charge",
+        },
+        outgoingHandlerSuccess,
+        &state,
+        .{},
+    );
+    try testing.expectEqual(@as(u16, 202), status_code);
+    try testing.expect(state.saw_trace_header);
+    try testing.expect(state.saw_baggage_header);
+
+    hub.finishTransaction(&txn);
+    hub.setSpan(null);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 1);
+
+    var saw_transaction = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") != null) {
+            saw_transaction = true;
+            try testing.expect(std.mem.indexOf(u8, payload, "\"description\":\"POST payments charge\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"status_code\":202") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"handler\":\"outgoing-success\"") != null);
+        }
+    }
+    try testing.expect(saw_transaction);
+}
+
+test "runOutgoingRequest can skip error capture while still finishing span" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    var txn = hub.startTransaction(.{
+        .name = "POST /checkout-skip-capture",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+    hub.setSpan(.{ .transaction = &txn });
+
+    try testing.expectError(
+        error.OutgoingPipelineFailure,
+        runOutgoingRequest(
+            .{
+                .method = "POST",
+                .url = "https://inventory.example.com/v1/reserve",
+            },
+            outgoingHandlerFailure,
+            null,
+            .{
+                .capture_errors = false,
+                .error_status_code = 504,
+            },
+        ),
+    );
+
+    hub.finishTransaction(&txn);
+    hub.setSpan(null);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 1);
+
+    var saw_transaction = false;
+    var saw_error_event = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") != null) {
+            saw_transaction = true;
+            try testing.expect(std.mem.indexOf(u8, payload, "\"status\":\"internal_error\"") != null or
+                std.mem.indexOf(u8, payload, "\"status\":\"unavailable\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"status_code\":504") != null);
+        }
+        if (std.mem.indexOf(u8, payload, "\"type\":\"event\"") != null and
+            std.mem.indexOf(u8, payload, "\"value\":\"OutgoingPipelineFailure\"") != null)
+        {
+            saw_error_event = true;
+        }
+    }
+    try testing.expect(saw_transaction);
+    try testing.expect(!saw_error_event);
 }

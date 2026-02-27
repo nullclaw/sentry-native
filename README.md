@@ -322,6 +322,25 @@ req_ctx.finish(null);
 ```
 
 ```zig
+// Middleware-style helper for inbound handlers (auto begin/finish/error capture)
+const status = try sentry.integrations.http.runIncomingRequest(
+    allocator,
+    client,
+    .{
+        .name = "GET /orders/:id",
+        .method = "GET",
+        .url = "https://api.example.com/orders/42",
+        .sentry_trace_header = incoming_sentry_trace,
+        .baggage_header = incoming_baggage,
+    },
+    incomingHandler,
+    handler_ctx,
+    .{},
+);
+_ = status;
+```
+
+```zig
 // Downstream HTTP helper: child span + propagation headers + status mapping
 var out = try sentry.integrations.http.OutgoingRequestContext.begin(.{
     .method = "POST",
@@ -336,6 +355,20 @@ defer headers.deinit(allocator);
 
 out.setStatusCode(200);
 out.finish(null);
+```
+
+```zig
+// Middleware-style helper for outbound handlers (auto span finish/error capture)
+const upstream_status = try sentry.integrations.http.runOutgoingRequest(
+    .{
+        .method = "POST",
+        .url = "https://payments.example.com/charge",
+    },
+    outgoingHandler,
+    handler_ctx,
+    .{},
+);
+_ = upstream_status;
 ```
 
 ```zig
