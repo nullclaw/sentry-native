@@ -332,6 +332,7 @@ var req_ctx = try sentry.integrations.http.RequestContext.begin(allocator, clien
     .url = "https://api.example.com/orders/42",
     .sentry_trace_header = incoming_sentry_trace,
     .baggage_header = incoming_baggage,
+    .add_breadcrumb_on_finish = true,
 });
 defer req_ctx.deinit();
 
@@ -405,6 +406,7 @@ defer header_list_w3c.deinit(allocator);
 
 out.setStatusCode(200);
 out.finish(null);
+// HTTP breadcrumb is added automatically on finish by default.
 ```
 
 ```zig

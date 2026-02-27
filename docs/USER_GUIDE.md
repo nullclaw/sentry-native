@@ -233,6 +233,8 @@ var req_ctx = try sentry.integrations.http.RequestContext.begin(allocator, clien
     .query_string = "expand=items",
     .sentry_trace_header = incoming_sentry_trace,
     .baggage_header = incoming_baggage,
+    .add_breadcrumb_on_finish = true,
+    .breadcrumb_category = "http.server",
 });
 defer req_ctx.deinit();
 
@@ -301,6 +303,8 @@ var out = try sentry.integrations.http.OutgoingRequestContext.begin(.{
     .method = "POST",
     .url = "https://payments.example.com/charge",
     .description = "POST payments charge",
+    .add_breadcrumb_on_finish = true,
+    .breadcrumb_category = "http.client",
 });
 defer out.deinit();
 
@@ -319,6 +323,9 @@ defer header_list_w3c.deinit(allocator);
 out.setStatusCode(200);
 out.finish(null);
 ```
+
+Both incoming and outgoing contexts add HTTP breadcrumbs on finish by default.
+Disable with `.add_breadcrumb_on_finish = false` when you need lower breadcrumb volume.
 
 Error path:
 

@@ -2,6 +2,8 @@ const std = @import("std");
 const testing = std.testing;
 
 const Client = @import("../client.zig").Client;
+const Breadcrumb = @import("../event.zig").Breadcrumb;
+const Level = @import("../event.zig").Level;
 const Hub = @import("../hub.zig").Hub;
 const Span = @import("../transaction.zig").Span;
 const Transaction = @import("../transaction.zig").Transaction;
@@ -21,6 +23,8 @@ pub const RequestOptions = struct {
     baggage_header: ?[]const u8 = null,
     set_scope_transaction_name: bool = true,
     origin: ?[]const u8 = "auto.http.server",
+    add_breadcrumb_on_finish: bool = true,
+    breadcrumb_category: []const u8 = "http.server",
 };
 
 /// Per-request instrumentation context.
@@ -36,6 +40,10 @@ pub const RequestContext = struct {
     finished: bool = false,
     active: bool = true,
     response_status_code: ?u16 = null,
+    request_method: ?[]const u8 = null,
+    request_url: ?[]const u8 = null,
+    add_breadcrumb_on_finish: bool = true,
+    breadcrumb_category: []const u8 = "http.server",
 
     pub fn begin(allocator: std.mem.Allocator, client: *Client, options: RequestOptions) !RequestContext {
         const hub_ptr = try allocator.create(Hub);
@@ -95,6 +103,10 @@ pub const RequestContext = struct {
             .hub = hub_ptr,
             .previous_hub = previous_hub,
             .txn = txn,
+            .request_method = options.method,
+            .request_url = options.url,
+            .add_breadcrumb_on_finish = options.add_breadcrumb_on_finish,
+            .breadcrumb_category = options.breadcrumb_category,
         };
     }
 
@@ -149,6 +161,16 @@ pub const RequestContext = struct {
             self.txn.setData("status_code", .{ .integer = @as(i64, code) }) catch {};
         }
 
+        if (self.add_breadcrumb_on_finish) {
+            addHttpBreadcrumb(
+                self.hub,
+                self.breadcrumb_category,
+                self.request_method,
+                self.request_url,
+                status_code,
+            );
+        }
+
         self.hub.finishTransaction(&self.txn);
         self.hub.setSpan(null);
         self.finished = true;
@@ -190,6 +212,8 @@ pub const OutgoingRequestOptions = struct {
     method: ?[]const u8 = null,
     url: ?[]const u8 = null,
     query_string: ?[]const u8 = null,
+    add_breadcrumb_on_finish: bool = true,
+    breadcrumb_category: []const u8 = "http.client",
 };
 
 pub const PropagationHeaders = struct {
@@ -245,6 +269,10 @@ pub const OutgoingRequestContext = struct {
     finished: bool = false,
     active: bool = true,
     response_status_code: ?u16 = null,
+    request_method: ?[]const u8 = null,
+    request_url: ?[]const u8 = null,
+    add_breadcrumb_on_finish: bool = true,
+    breadcrumb_category: []const u8 = "http.client",
 
     pub fn begin(options: OutgoingRequestOptions) !OutgoingRequestContext {
         const hub = Hub.current() orelse return error.NoCurrentHub;
@@ -268,6 +296,10 @@ pub const OutgoingRequestContext = struct {
             .hub = hub,
             .previous_span = previous_span,
             .span = span,
+            .request_method = options.method,
+            .request_url = options.url,
+            .add_breadcrumb_on_finish = options.add_breadcrumb_on_finish,
+            .breadcrumb_category = options.breadcrumb_category,
         };
     }
 
@@ -378,6 +410,16 @@ pub const OutgoingRequestContext = struct {
         if (status_code) |code| {
             self.span.setStatus(spanStatusFromHttpStatus(code));
             self.span.setData("status_code", .{ .integer = @as(i64, code) }) catch {};
+        }
+
+        if (self.add_breadcrumb_on_finish) {
+            addHttpBreadcrumb(
+                self.hub,
+                self.breadcrumb_category,
+                self.request_method,
+                self.request_url,
+                status_code,
+            );
         }
         self.span.finish();
         self.finished = true;
@@ -504,6 +546,48 @@ fn sentryTraceFromTraceParent(traceparent: []const u8, output: *[51]u8) ?[]const
     output[49] = '-';
     output[50] = sampled;
     return output[0..];
+}
+
+fn breadcrumbLevelFromStatus(status_code: ?u16) Level {
+    const code = status_code orelse return .info;
+    if (code >= 500) return .err;
+    if (code >= 400) return .warning;
+    return .info;
+}
+
+fn addHttpBreadcrumb(
+    hub: *Hub,
+    category: []const u8,
+    method: ?[]const u8,
+    url: ?[]const u8,
+    status_code: ?u16,
+) void {
+    var message_buf: [512]u8 = undefined;
+    const message = if (status_code) |code|
+        if (method) |request_method|
+            if (url) |request_url|
+                std.fmt.bufPrint(&message_buf, "{s} {s} -> {d}", .{ request_method, request_url, code }) catch null
+            else
+                std.fmt.bufPrint(&message_buf, "{s} -> {d}", .{ request_method, code }) catch null
+        else if (url) |request_url|
+            std.fmt.bufPrint(&message_buf, "{s} -> {d}", .{ request_url, code }) catch null
+        else
+            std.fmt.bufPrint(&message_buf, "HTTP {d}", .{code}) catch null
+    else if (method) |request_method|
+        if (url) |request_url|
+            std.fmt.bufPrint(&message_buf, "{s} {s}", .{ request_method, request_url }) catch null
+        else
+            std.fmt.bufPrint(&message_buf, "{s}", .{request_method}) catch null
+    else
+        url;
+
+    const crumb: Breadcrumb = .{
+        .type = "http",
+        .category = category,
+        .message = message,
+        .level = breadcrumbLevelFromStatus(status_code),
+    };
+    hub.addBreadcrumb(crumb);
 }
 
 /// Run an incoming HTTP handler inside `RequestContext` lifecycle.
@@ -1181,6 +1265,98 @@ test "runIncomingRequestFromHeaders continues trace from traceparent when sentry
     try testing.expect(client.flush(1000));
     try testing.expect(payload_state.payloads.items.len >= 1);
     try testing.expect(std.mem.indexOf(u8, payload_state.payloads.items[0], "0123456789abcdef0123456789abcdef") != null);
+}
+
+test "RequestContext finish adds HTTP breadcrumb with request metadata" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var req = try RequestContext.begin(testing.allocator, client, .{
+        .name = "GET /crumbs",
+        .method = "GET",
+        .url = "https://api.example.com/crumbs",
+    });
+    defer req.deinit();
+
+    req.finish(503);
+    _ = req.hub.captureMessageId("post-request event", .info);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 2);
+
+    var saw_breadcrumb_message = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"event\"") != null and
+            std.mem.indexOf(u8, payload, "GET https://api.example.com/crumbs -> 503") != null)
+        {
+            saw_breadcrumb_message = true;
+        }
+    }
+    try testing.expect(saw_breadcrumb_message);
+}
+
+test "OutgoingRequestContext finish adds HTTP breadcrumb with request metadata" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    var txn = hub.startTransaction(.{
+        .name = "GET /outgoing-crumb",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+    hub.setSpan(.{ .transaction = &txn });
+
+    var out = try OutgoingRequestContext.begin(.{
+        .method = "POST",
+        .url = "https://payments.example.com/v1/charge",
+    });
+    defer out.deinit();
+
+    out.finish(201);
+    _ = hub.captureMessageId("after outgoing call", .info);
+
+    hub.finishTransaction(&txn);
+    hub.setSpan(null);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 2);
+
+    var saw_breadcrumb_message = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"event\"") != null and
+            std.mem.indexOf(u8, payload, "POST https://payments.example.com/v1/charge -> 201") != null)
+        {
+            saw_breadcrumb_message = true;
+        }
+    }
+    try testing.expect(saw_breadcrumb_message);
 }
 
 test "runIncomingRequest captures handler errors and marks transaction as internal_error" {
