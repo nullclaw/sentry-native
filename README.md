@@ -8,6 +8,11 @@ predictable shutdown behavior.
 
 Detailed guide: [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
 
+## Documentation Map
+
+- [README.md](README.md): install, architecture map, production bootstrap.
+- [docs/USER_GUIDE.md](docs/USER_GUIDE.md): full usage reference with advanced flows.
+
 ## Quickstart
 
 ```zig
@@ -58,11 +63,49 @@ const sentry_dep = b.dependency("sentry-zig", .{
 exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 ```
 
+## Build and Delivery Model
+
+Sentry-Zig is consumed as a Zig dependency source package.
+
+- You do not need to publish or preload SDK-specific binary artifacts.
+- Your application CI/CD resolves the dependency (`zig fetch`), compiles your app,
+  and runs tests.
+- Release tags are used for deterministic builds.
+
+## CI/CD Integration
+
+Minimal CI checks:
+
+- `zig build test` on every pull request.
+- `zig build test-integration` in integration/staging pipelines.
+- `zig fmt --check .` for formatting gate.
+
+Example GitHub Actions workflow:
+
+```yaml
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - run: zig build test
+      - run: zig build test-integration
+```
+
 ## Versioning and Releases
 
 - Current stable release: `v0.1.0`
 - Versioning policy: Semantic Versioning (SemVer)
-- Use release tags for pinned dependencies and deterministic CI/CD builds.
+- Zig compatibility target: `>= 0.15.2` (older Zig versions are out of scope)
+- Use release tags for pinned dependencies and deterministic builds.
 
 ## Core Concepts
 
@@ -79,8 +122,8 @@ exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 ## Zig-First API
 
 - Most mutating API calls have both forms:
-- ergonomic (`setTag`, `addBreadcrumb`, `addAttachment`) that never fail outwardly.
-- explicit fallible (`trySetTag`, `tryAddBreadcrumb`, `tryAddAttachment`) for strict error handling.
+  - ergonomic (`setTag`, `addBreadcrumb`, `addAttachment`) that never fail outwardly.
+  - explicit fallible (`trySetTag`, `tryAddBreadcrumb`, `tryAddAttachment`) for strict error handling.
 - Use `try*` methods when you want full control over `OutOfMemory` and other allocation failures.
 
 ## Feature Status
@@ -265,6 +308,13 @@ All options are provided via `sentry.Options` in `sentry.init`.
 | `accept_invalid_certs` | `bool` | `false` | Disable TLS certificate verification for direct HTTPS transport (development/testing only) |
 | `max_request_body_size` | `?usize` | `null` | Drop envelopes larger than this byte size |
 | `enable_logs` | `bool` | `true` | Enable/disable structured log submissions |
+| `cache_dir` | `[]const u8` | `"/tmp/sentry-zig"` | Crash marker directory |
+| `user_agent` | `[]const u8` | `"sentry-zig/0.1.0"` | Transport User-Agent |
+| `install_signal_handlers` | `bool` | `true` | POSIX signal handler install |
+| `auto_session_tracking` | `bool` | `false` | Auto-start session on init |
+| `session_mode` | `SessionMode` | `.application` | `.application` / `.request` |
+| `session_aggregate_flush_interval_ms` | `u64` | `60000` | Request-mode aggregate auto-flush interval (`0` disables timer flush) |
+| `shutdown_timeout_ms` | `u64` | `2000` | Timeout for shutdown flush |
 
 When `default_integrations = false`, automatic runtime/os context enrichment is disabled
 (trace context bootstrap remains enabled).
@@ -286,13 +336,6 @@ fn setupCheckoutIntegration(client: *sentry.Client, _: ?*anyopaque) void {
     client.setTag("integration", "checkout");
 }
 ```
-| `cache_dir` | `[]const u8` | `"/tmp/sentry-zig"` | Crash marker directory |
-| `user_agent` | `[]const u8` | `"sentry-zig/0.1.0"` | Transport User-Agent |
-| `install_signal_handlers` | `bool` | `true` | POSIX signal handler install |
-| `auto_session_tracking` | `bool` | `false` | Auto-start session on init |
-| `session_mode` | `SessionMode` | `.application` | `.application` / `.request` |
-| `session_aggregate_flush_interval_ms` | `u64` | `60000` | Request-mode aggregate auto-flush interval (`0` disables timer flush) |
-| `shutdown_timeout_ms` | `u64` | `2000` | Timeout for shutdown flush |
 
 See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for full examples and edge cases.
 
@@ -301,6 +344,14 @@ See [docs/USER_GUIDE.md](docs/USER_GUIDE.md) for full examples and edge cases.
 - `flush(timeout_ms)` waits for queue drain without stopping client.
 - `close(null)` flushes (with default timeout) and shuts down worker.
 - `deinit()` is the standard safe shutdown path and should always run.
+
+## Operational Readiness
+
+- Set `release`, `environment`, and `server_name` explicitly.
+- Validate event delivery on a staging environment before production rollout.
+- Keep queue drain guarantees in shutdown hooks (`flush` + `deinit`).
+- Add `before_send` / processors for redaction and noise filtering.
+- Tune sampling and queue/body limits to your traffic profile.
 
 ## Testing
 
@@ -318,10 +369,10 @@ zig build test-integration
 
 Tracing note: each transaction stores up to `1000` child spans (`MAX_SPANS`).
 
-## Roadmap Notes
+## Resources
 
-Current focus is complete stability of core data flows:
-events, tracing, sessions, envelopes, and transport behavior.
+- Full guide: [docs/USER_GUIDE.md](docs/USER_GUIDE.md)
+- Project repository: [github.com/nullclaw/sentry-zig](https://github.com/nullclaw/sentry-zig)
 
 ## License
 

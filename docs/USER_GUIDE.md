@@ -6,21 +6,26 @@ in a production application.
 ## Table of Contents
 
 1. [Quick Start](#quick-start)
-2. [Integration in build.zig](#integration-in-buildzig)
-3. [Client Lifecycle](#client-lifecycle)
-4. [Event Capture and event_id](#event-capture-and-event_id)
-5. [Working with Scope](#working-with-scope)
-6. [Attachments](#attachments)
-7. [Tracing and Transactions](#tracing-and-transactions)
-8. [Release Health Sessions](#release-health-sessions)
-9. [Monitor Check-Ins](#monitor-check-ins)
-10. [Structured Logs](#structured-logs)
-11. [Hooks and Processors](#hooks-and-processors)
-12. [Rate Limits and Queue](#rate-limits-and-queue)
-13. [Crash Handling (POSIX)](#crash-handling-posix)
-14. [Production Checklist](#production-checklist)
-15. [Troubleshooting](#troubleshooting)
-16. [SDK Status](#sdk-status)
+2. [Compatibility and Support Policy](#compatibility-and-support-policy)
+3. [Build and Delivery Model](#build-and-delivery-model)
+4. [Integration in build.zig](#integration-in-buildzig)
+5. [CI/CD Reference](#cicd-reference)
+6. [Client Lifecycle](#client-lifecycle)
+7. [Event Capture and event_id](#event-capture-and-event_id)
+8. [Working with Scope](#working-with-scope)
+9. [Attachments](#attachments)
+10. [Tracing and Transactions](#tracing-and-transactions)
+11. [Release Health Sessions](#release-health-sessions)
+12. [Monitor Check-Ins](#monitor-check-ins)
+13. [Structured Logs](#structured-logs)
+14. [Hooks and Processors](#hooks-and-processors)
+15. [Rate Limits and Queue](#rate-limits-and-queue)
+16. [Crash Handling (POSIX)](#crash-handling-posix)
+17. [Performance Tuning](#performance-tuning)
+18. [Security and Data Governance](#security-and-data-governance)
+19. [Production Checklist](#production-checklist)
+20. [Troubleshooting](#troubleshooting)
+21. [Support Model](#support-model)
 
 ## Quick Start
 
@@ -44,6 +49,22 @@ pub fn main() !void {
 }
 ```
 
+## Compatibility and Support Policy
+
+- Zig version: `>= 0.15.2`.
+- The SDK does not target older Zig versions.
+- Versioning follows SemVer tags (`vMAJOR.MINOR.PATCH`).
+- For deterministic production builds, pin exact release tags.
+
+## Build and Delivery Model
+
+Sentry-Zig is distributed as source and integrated directly into your Zig build.
+
+- No separate SDK binary publishing step is required.
+- Your application pipeline should resolve the dependency, build your app,
+  run tests, and publish your own deployable artifact.
+- Use tagged source tarballs for reproducibility and controlled upgrades.
+
 ## Integration in build.zig
 
 ```sh
@@ -65,6 +86,42 @@ exe.root_module.addImport("sentry-zig", sentry_dep.module("sentry-zig"));
 ```
 
 Current stable release: `v0.1.0` (SemVer tags).
+
+## CI/CD Reference
+
+Recommended checks:
+
+- `zig fmt --check .`
+- `zig build test`
+- `zig build test-integration` (staging/integration environments)
+
+Example GitHub Actions workflow:
+
+```yaml
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - run: zig fmt --check .
+      - run: zig build test
+      - run: zig build test-integration
+```
+
+Release checklist:
+
+1. Update version references in docs if needed.
+2. Tag the repository (`vX.Y.Z`).
+3. Validate integration tests against the tag.
+4. Roll out in staged environments before production.
 
 ## Client Lifecycle
 
@@ -573,6 +630,31 @@ Configuration:
 
 `accept_invalid_certs=true` is not supported together with explicit proxy transport settings.
 
+## Performance Tuning
+
+Primary tuning knobs:
+
+- `sample_rate`: controls event volume (`0.0..1.0`).
+- `traces_sample_rate` / `traces_sampler`: controls tracing volume.
+- `max_request_body_size`: drops oversized envelopes early.
+- `max_breadcrumbs`: bounds per-event breadcrumb memory.
+- `session_aggregate_flush_interval_ms`: controls request-mode session aggregate flush cadence.
+
+Operational guidance:
+
+- Use lower sample rates in high-throughput services.
+- Prefer dynamic sampling (`traces_sampler`) for critical paths.
+- Monitor queue pressure and raise shutdown timeout if needed.
+- Keep attachment payload sizes bounded.
+
+## Security and Data Governance
+
+- Use `before_send`, `before_send_transaction`, and `before_send_log` to redact sensitive fields.
+- Use `before_breadcrumb` to drop noisy or sensitive breadcrumbs.
+- Set `send_default_pii` intentionally according to your privacy policy.
+- Keep `accept_invalid_certs=false` outside local development.
+- Review `Scope` data writes to avoid accidental PII leakage (`user`, `extras`, `contexts`).
+
 ## Production Checklist
 
 - Set `release`, `environment`, and `server_name` explicitly.
@@ -601,17 +683,18 @@ Configuration:
 
 - Set `Options.environment`, or fill `check_in.environment` manually.
 
-## SDK Status
+### Events are dropped under load
 
-Current focus:
-- events/scope/envelope pipeline,
-- transactions/spans/sampling,
-- release health sessions,
-- monitor check-ins,
-- worker + transport rate limits.
+- Confirm whether sampling is intentionally low (`sample_rate`, tracing sampling).
+- Check queue saturation patterns in your service lifecycle.
+- Reduce envelope size (`max_request_body_size`, attachment payloads).
+- Verify Sentry rate-limit responses (`Retry-After`, `X-Sentry-Rate-Limits`).
 
-Roadmap:
-- expanded integration ecosystem.
+## Support Model
+
+- Stable surface: core capture APIs, tracing/session/check-in flows, envelope transport.
+- Compatibility baseline: Zig `0.15.2+`.
+- Change tracking: follow repository tags and commit history.
 
 To track changes, use commit history and integration tests
 in `tests/integration_test.zig`.
