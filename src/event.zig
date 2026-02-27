@@ -103,6 +103,7 @@ pub const Event = struct {
     extra: ?json.Value = null,
     user: ?User = null,
     contexts: ?json.Value = null,
+    debug_meta: ?json.Value = null,
     breadcrumbs: ?[]const Breadcrumb = null,
     fingerprint: ?[]const []const u8 = null,
 

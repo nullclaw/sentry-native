@@ -12,6 +12,7 @@ const TransactionOrSpan = @import("../transaction.zig").TransactionOrSpan;
 const SpanStatus = @import("../transaction.zig").SpanStatus;
 const PropagationHeader = @import("../propagation.zig").PropagationHeader;
 const SendOutcome = @import("../worker.zig").SendOutcome;
+const otel = @import("otel.zig");
 
 pub const RequestOptions = struct {
     name: []const u8,
@@ -508,54 +509,13 @@ pub fn extractIncomingPropagationHeaders(headers: []const PropagationHeader) Inc
     return result;
 }
 
-fn parseHexNibble(c: u8) ?u8 {
-    return switch (c) {
-        '0'...'9' => c - '0',
-        'a'...'f' => c - 'a' + 10,
-        'A'...'F' => c - 'A' + 10,
-        else => null,
-    };
-}
-
-fn parseHexByte(two_hex_chars: []const u8) ?u8 {
-    if (two_hex_chars.len != 2) return null;
-    const hi = parseHexNibble(two_hex_chars[0]) orelse return null;
-    const lo = parseHexNibble(two_hex_chars[1]) orelse return null;
-    return (hi << 4) | lo;
-}
-
-fn isAllZeros(slice: []const u8) bool {
-    for (slice) |value| {
-        if (value != '0') return false;
-    }
-    return true;
-}
-
 fn sentryTraceFromTraceParent(traceparent: []const u8, output: *[51]u8) ?[]const u8 {
-    const trimmed = std.mem.trim(u8, traceparent, " \t");
-    var it = std.mem.splitScalar(u8, trimmed, '-');
+    const parsed = otel.parseTraceParent(traceparent) orelse return null;
+    const sampled: u8 = if (parsed.sampled == true) '1' else '0';
 
-    const version = it.next() orelse return null;
-    const trace_id = it.next() orelse return null;
-    const span_id = it.next() orelse return null;
-    const flags = it.next() orelse return null;
-    if (it.next() != null) return null;
-
-    if (version.len != 2 or trace_id.len != 32 or span_id.len != 16 or flags.len != 2) return null;
-    if (isAllZeros(trace_id) or isAllZeros(span_id)) return null;
-
-    for (trace_id) |c| {
-        _ = parseHexNibble(c) orelse return null;
-    }
-    for (span_id) |c| {
-        _ = parseHexNibble(c) orelse return null;
-    }
-    const flags_value = parseHexByte(flags) orelse return null;
-    const sampled: u8 = if ((flags_value & 1) != 0) '1' else '0';
-
-    @memcpy(output[0..32], trace_id);
+    @memcpy(output[0..32], parsed.trace_id[0..]);
     output[32] = '-';
-    @memcpy(output[33..49], span_id);
+    @memcpy(output[33..49], parsed.parent_span_id[0..]);
     output[49] = '-';
     output[50] = sampled;
     return output[0..];

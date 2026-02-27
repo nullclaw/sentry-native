@@ -144,11 +144,11 @@ jobs:
 | Monitor check-ins | Implemented | `check_in` envelopes with env inheritance |
 | Worker + queue draining | Implemented | Bounded queue + `flush`/`close` semantics |
 | Transport rate limits | Implemented | `Retry-After` + `X-Sentry-Rate-Limits` parsing |
-| Transport customization | Implemented | Custom transport callback + explicit HTTP/HTTPS proxy options |
+| Transport customization | Implemented | Custom transport callback + explicit HTTP/HTTPS proxy options + built-in `transport_backends.file` / `transport_backends.fanout` |
 | Signal crash marker flow | Implemented | POSIX marker write/read cycle |
 | Hub/TLS scope stack | Implemented | Push/pop scopes + TLS current hub helpers |
 | Structured logs pipeline | Implemented | `log` envelope items + `captureLogMessage` API |
-| Auto integration helpers | Implemented | Global init guard + std.log/panic/http inbound+outbound/error/runtime helper integrations |
+| Auto integration helpers | Implemented | Global init guard + std.log/panic/http inbound+outbound/error/runtime helper integrations + OTel traceparent helper API |
 | Extended integrations | Roadmap | Additional framework/runtime integrations will be added incrementally |
 
 ## Common Usage
@@ -410,6 +410,37 @@ out.finish(null);
 ```
 
 ```zig
+// OTel/W3C traceparent continuation helper
+var txn_from_traceparent = try sentry.integrations.otel.startTransactionFromTraceParent(
+    client,
+    .{ .name = "GET /inventory", .op = "http.server" },
+    incoming_traceparent_header,
+);
+defer txn_from_traceparent.deinit();
+```
+
+```zig
+// Built-in transport backend composition
+var file_backend = try sentry.transport_backends.file.Backend.init(allocator, .{
+    .directory = "/var/tmp/sentry-outbox",
+});
+defer file_backend.deinit();
+const file_transport = file_backend.transportConfig();
+
+var fanout_backend = try sentry.transport_backends.fanout.Backend.init(allocator, &.{
+    .{ .send_fn = file_transport.send_fn, .ctx = file_transport.ctx },
+    // Add more targets here (for example, another file sink or custom sender).
+});
+defer fanout_backend.deinit();
+
+const client = try sentry.init(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+    .transport = fanout_backend.transportConfig(),
+});
+defer client.deinit();
+```
+
+```zig
 // Middleware-style helper for outbound handlers (auto span finish/error capture)
 const upstream_status = try sentry.integrations.http.runOutgoingRequest(
     .{
@@ -464,6 +495,7 @@ All options are provided via `sentry.Options` in `sentry.init`.
 | `traces_sampler` | `?TracesSampler` | `null` | Per-transaction sampling callback |
 | `max_breadcrumbs` | `u32` | `100` | Scope breadcrumb cap |
 | `attach_stacktrace` | `bool` | `false` | Attach synthetic thread stacktrace payload when event has no threads |
+| `attach_debug_images` | `bool` | `true` | Attach default `debug_meta.images` payload when event has no debug image metadata |
 | `send_default_pii` | `bool` | `false` | Reserved option for explicit PII policy toggles |
 | `in_app_include` | `?[]const []const u8` | `null` | Optional in-app include patterns for stack frame classification |
 | `in_app_exclude` | `?[]const []const u8` | `null` | Optional in-app exclude patterns for stack frame classification |
@@ -498,6 +530,7 @@ Structured log records automatically include default `sentry.environment`,
 `sentry.release`, and `server.address` attributes when configured.
 When `server_name` is unset and `default_integrations = true`, the SDK attempts to use the local hostname.
 `in_app_include`/`in_app_exclude` are applied to exception stack frames.
+`attach_debug_images=true` injects default `debug_meta.images` metadata for events that do not already include debug image info.
 `accept_invalid_certs=true` is intended for local/dev environments and is not supported together with explicit proxy transport.
 
 Example integration setup callback:

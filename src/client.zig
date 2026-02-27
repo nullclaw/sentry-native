@@ -112,6 +112,7 @@ pub const Options = struct {
     traces_sampler: ?TracesSampler = null,
     max_breadcrumbs: u32 = 100,
     attach_stacktrace: bool = false,
+    attach_debug_images: bool = true,
     send_default_pii: bool = false,
     in_app_include: ?[]const []const u8 = null,
     in_app_exclude: ?[]const []const u8 = null,
@@ -472,6 +473,27 @@ pub const Client = struct {
             if (threads) |value| {
                 prepared_event.threads = value;
                 owned_threads = value;
+            }
+        }
+
+        var owned_debug_meta: ?json.Value = null;
+        defer if (owned_debug_meta) |*debug_meta| {
+            scope_mod.deinitJsonValueDeep(self.allocator, debug_meta);
+            prepared_event.debug_meta = null;
+        };
+
+        if (self.options.attach_debug_images) {
+            if (prepared_event.debug_meta == null) {
+                const debug_meta = buildDefaultDebugMeta(self.allocator) catch null;
+                if (debug_meta) |value| {
+                    prepared_event.debug_meta = value;
+                    owned_debug_meta = value;
+                }
+            } else {
+                if (mergeDefaultDebugMeta(self.allocator, prepared_event) catch null) |value| {
+                    prepared_event.debug_meta = value;
+                    owned_debug_meta = value;
+                }
             }
         }
 
@@ -1373,6 +1395,75 @@ pub const Client = struct {
         return .{ .object = threads_object };
     }
 
+    fn debugImageType() []const u8 {
+        return switch (builtin.object_format) {
+            .coff => "pe",
+            .elf => "elf",
+            .macho => "macho",
+            .wasm => "wasm",
+            else => "other",
+        };
+    }
+
+    fn buildDefaultDebugMeta(allocator: Allocator) !json.Value {
+        var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const code_file = std.fs.selfExePath(&exe_path_buf) catch @tagName(builtin.os.tag);
+
+        var image_object = json.ObjectMap.init(allocator);
+        var image_moved = false;
+        errdefer if (!image_moved) {
+            var value: json.Value = .{ .object = image_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        };
+
+        try putOwnedString(allocator, &image_object, "type", debugImageType());
+        try putOwnedString(allocator, &image_object, "code_file", code_file);
+
+        var images_array = json.Array.init(allocator);
+        var images_moved = false;
+        errdefer if (!images_moved) {
+            var value: json.Value = .{ .array = images_array };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        };
+
+        try images_array.append(.{ .object = image_object });
+        image_moved = true;
+
+        var debug_meta_object = json.ObjectMap.init(allocator);
+        errdefer {
+            var value: json.Value = .{ .object = debug_meta_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        }
+
+        try putOwnedJsonEntry(allocator, &debug_meta_object, "images", .{ .array = images_array });
+        images_moved = true;
+
+        return .{ .object = debug_meta_object };
+    }
+
+    fn mergeDefaultDebugMeta(allocator: Allocator, event: *Event) !?json.Value {
+        const debug_meta = event.debug_meta orelse return null;
+        if (debug_meta != .object) return null;
+        if (debug_meta.object.get("images") != null) return null;
+
+        var merged = try scope_mod.cloneJsonValue(allocator, debug_meta);
+        errdefer scope_mod.deinitJsonValueDeep(allocator, &merged);
+        if (merged != .object) return null;
+
+        const defaults = try buildDefaultDebugMeta(allocator);
+        defer {
+            var defaults_owned = defaults;
+            scope_mod.deinitJsonValueDeep(allocator, &defaults_owned);
+        }
+        if (defaults != .object) return null;
+
+        const defaults_images = defaults.object.get("images") orelse return null;
+        var images_copy = try scope_mod.cloneJsonValue(allocator, defaults_images);
+        errdefer scope_mod.deinitJsonValueDeep(allocator, &images_copy);
+        try putOwnedJsonEntry(allocator, &merged.object, "images", images_copy);
+        return merged;
+    }
+
     fn mergeDefaultTraceContexts(
         allocator: Allocator,
         event: *Event,
@@ -2002,6 +2093,7 @@ test "Options struct has correct defaults" {
     try testing.expect(opts.traces_sampler == null);
     try testing.expectEqual(@as(u32, 100), opts.max_breadcrumbs);
     try testing.expect(!opts.attach_stacktrace);
+    try testing.expect(opts.attach_debug_images);
     try testing.expect(!opts.send_default_pii);
     try testing.expect(opts.in_app_include == null);
     try testing.expect(opts.in_app_exclude == null);
@@ -2451,10 +2543,22 @@ fn hasThreadStacktrace(event: *const Event) bool {
     return false;
 }
 
+fn hasDebugMetaImages(event: *const Event) bool {
+    const debug_meta = event.debug_meta orelse return false;
+    if (debug_meta != .object) return false;
+    const images = debug_meta.object.get("images") orelse return false;
+    return switch (images) {
+        .array => |arr| arr.items.len > 0,
+        else => false,
+    };
+}
+
 var before_send_saw_trace_context: bool = false;
 var before_send_saw_runtime_context: bool = false;
 var before_send_saw_os_context: bool = false;
 var before_send_saw_threads: bool = false;
+var before_send_saw_debug_meta_images: bool = false;
+var before_send_debug_meta_custom_preserved: bool = false;
 var before_send_first_frame_in_app: ?bool = null;
 var before_send_observed_server_name: ?[]const u8 = null;
 var before_send_observed_dist: ?[]const u8 = null;
@@ -2525,6 +2629,24 @@ fn inspectLogTraceMatchesSpanBeforeSend(entry: *LogEntry) ?*LogEntry {
 
 fn inspectThreadsBeforeSend(event: *Event) ?*Event {
     before_send_saw_threads = hasThreadStacktrace(event);
+    return event;
+}
+
+fn inspectDebugMetaBeforeSend(event: *Event) ?*Event {
+    before_send_saw_debug_meta_images = hasDebugMetaImages(event);
+    return event;
+}
+
+fn inspectMergedDebugMetaBeforeSend(event: *Event) ?*Event {
+    before_send_saw_debug_meta_images = hasDebugMetaImages(event);
+    before_send_debug_meta_custom_preserved = false;
+
+    const debug_meta = event.debug_meta orelse return event;
+    if (debug_meta != .object) return event;
+    const custom = debug_meta.object.get("custom") orelse return event;
+    if (custom == .string and std.mem.eql(u8, custom.string, "value")) {
+        before_send_debug_meta_custom_preserved = true;
+    }
     return event;
 }
 
@@ -3069,6 +3191,64 @@ test "Client attach_stacktrace adds synthetic thread stacktrace data" {
 
     try testing.expect(client.captureMessageId("stacktrace-message", .warning) != null);
     try testing.expect(before_send_saw_threads);
+}
+
+test "Client attach_debug_images adds debug_meta images by default" {
+    before_send_saw_debug_meta_images = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send = inspectDebugMetaBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureMessageId("debug-images-default", .info) != null);
+    try testing.expect(before_send_saw_debug_meta_images);
+}
+
+test "Client attach_debug_images can be disabled explicitly" {
+    before_send_saw_debug_meta_images = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .attach_debug_images = false,
+        .before_send = inspectDebugMetaBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureMessageId("debug-images-disabled", .info) != null);
+    try testing.expect(!before_send_saw_debug_meta_images);
+}
+
+test "Client attach_debug_images merges images into existing debug_meta without mutating input event" {
+    before_send_saw_debug_meta_images = false;
+    before_send_debug_meta_custom_preserved = false;
+
+    var debug_meta_object = json.ObjectMap.init(testing.allocator);
+    defer {
+        var owned_debug_meta: json.Value = .{ .object = debug_meta_object };
+        scope_mod.deinitJsonValueDeep(testing.allocator, &owned_debug_meta);
+    }
+    const custom_key = try testing.allocator.dupe(u8, "custom");
+    const custom_value = try testing.allocator.dupe(u8, "value");
+    try debug_meta_object.put(custom_key, .{ .string = custom_value });
+
+    var event = Event.initMessage("debug-images-merge", .warning);
+    event.debug_meta = .{ .object = debug_meta_object };
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .before_send = inspectMergedDebugMetaBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expect(before_send_saw_debug_meta_images);
+    try testing.expect(before_send_debug_meta_custom_preserved);
+    try testing.expect(debug_meta_object.get("images") == null);
 }
 
 test "Client auto_session_tracking does not start session without release" {

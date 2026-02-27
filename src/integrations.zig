@@ -9,3 +9,4 @@ pub const http = @import("integrations/http.zig");
 pub const errors = @import("integrations/errors.zig");
 pub const runtime = @import("integrations/runtime.zig");
 pub const auto = @import("integrations/auto.zig");
+pub const otel = @import("integrations/otel.zig");

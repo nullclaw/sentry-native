@@ -56,6 +56,7 @@ pub const cleanupAppliedToEvent = @import("scope.zig").cleanupAppliedToEvent;
 pub const Hub = @import("hub.zig").Hub;
 pub const Transport = @import("transport.zig").Transport;
 pub const MockTransport = @import("transport.zig").MockTransport;
+pub const transport_backends = @import("transport_backends.zig");
 pub const envelope = @import("envelope.zig");
 pub const SentryTrace = @import("propagation.zig").SentryTrace;
 pub const DynamicSamplingContext = @import("propagation.zig").DynamicSamplingContext;
@@ -175,6 +176,10 @@ pub fn startTransactionFromSentryTrace(opts: TransactionOpts, sentry_trace_heade
 pub fn startTransactionFromHeaders(opts: TransactionOpts, headers: []const PropagationHeader) ?Transaction {
     const hub = Hub.current() orelse return null;
     return hub.startTransactionFromHeaders(opts, headers);
+}
+
+pub fn startTransactionFromTraceParent(opts: TransactionOpts, traceparent_header: []const u8) ?Transaction {
+    return integrations.otel.startCurrentHubTransactionFromTraceParent(opts, traceparent_header) catch null;
 }
 
 pub fn startTransactionFromSpan(opts: TransactionOpts, source: ?TransactionOrSpan) ?Transaction {
@@ -412,6 +417,10 @@ test "global wrappers are safe no-op without current hub" {
         .{ .name = "sentry-trace", .value = "0123456789abcdef0123456789abcdef-89abcdef01234567-1" },
     };
     try std.testing.expect(startTransactionFromHeaders(.{ .name = "no-hub" }, &no_hub_headers) == null);
+    try std.testing.expect(startTransactionFromTraceParent(
+        .{ .name = "no-hub" },
+        "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01",
+    ) == null);
     try std.testing.expect(startTransactionFromSpan(.{ .name = "no-hub" }, null) == null);
     try std.testing.expect(startTransactionFromPropagationHeaders(
         .{ .name = "no-hub" },
@@ -548,6 +557,13 @@ test "global wrappers route through current hub" {
     ).?;
     defer continued_from_headers.deinit();
     try std.testing.expectEqualStrings("fedcba9876543210fedcba9876543210", continued_from_headers.trace_id[0..]);
+
+    var continued_from_traceparent = startTransactionFromTraceParent(
+        .{ .name = "GET /continued-global-traceparent", .op = "http.server" },
+        "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01",
+    ).?;
+    defer continued_from_traceparent.deinit();
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", continued_from_traceparent.trace_id[0..]);
 
     var continued_from_span = startTransactionFromSpan(
         .{ .name = "GET /continued-global-span", .op = "http.server" },

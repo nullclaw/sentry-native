@@ -217,6 +217,8 @@ Optional runtime configuration:
 sentry.integrations.panic.install(.{
     .exception_type = "AppPanic",
     .flush_timeout_ms = 2000,
+    .capture_backtrace = true,
+    .max_backtrace_frames = 32,
 });
 ```
 
@@ -758,6 +760,24 @@ defer parsed_baggage_owned.deinit();
 const parsed_trace = sentry.parseHeaders(&headers);
 ```
 
+### OTel/W3C traceparent helpers
+
+Use `integrations.otel` when your edge/middleware primarily exposes W3C `traceparent`.
+
+```zig
+const traceparent = "00-0123456789abcdef0123456789abcdef-89abcdef01234567-01";
+
+var txn = try sentry.integrations.otel.startTransactionFromTraceParent(
+    client,
+    .{ .name = "GET /inventory", .op = "http.server" },
+    traceparent,
+);
+defer txn.deinit();
+
+const outgoing_traceparent = try sentry.integrations.otel.traceParentFromTransactionAlloc(allocator, &txn);
+defer allocator.free(outgoing_traceparent);
+```
+
 ### attach_stacktrace
 
 ```zig
@@ -769,6 +789,18 @@ const client = try sentry.init(allocator, .{
 
 With `attach_stacktrace=true`, the SDK adds thread stacktrace payload for events
 where `threads` are not already populated.
+
+### attach_debug_images
+
+```zig
+const client = try sentry.init(allocator, .{
+    .dsn = "...",
+    .attach_debug_images = true, // default
+});
+```
+
+With `attach_debug_images=true`, the SDK injects default `debug_meta.images`
+for events that do not already provide debug image metadata.
 
 ## Release Health Sessions
 
@@ -888,6 +920,32 @@ Default behavior:
 - when the queue overflows, the oldest items are dropped;
 - envelopes with `event` (including those with attachments) follow the `error` category rate limit;
 - `session`, `transaction`, and `check_in` categories are limited independently.
+
+### Built-in transport backends
+
+For custom delivery pipelines, use:
+- `sentry.transport_backends.file.Backend` to persist envelopes as files.
+- `sentry.transport_backends.fanout.Backend` to send each envelope to multiple targets.
+
+```zig
+var file_backend = try sentry.transport_backends.file.Backend.init(allocator, .{
+    .directory = "/var/tmp/sentry-outbox",
+});
+defer file_backend.deinit();
+const file_transport = file_backend.transportConfig();
+
+var fanout_backend = try sentry.transport_backends.fanout.Backend.init(allocator, &.{
+    .{ .send_fn = file_transport.send_fn, .ctx = file_transport.ctx },
+    // Add more targets here (for example, another file sink or custom sender).
+});
+defer fanout_backend.deinit();
+
+const client = try sentry.init(allocator, .{
+    .dsn = "https://PUBLIC_KEY@o0.ingest.sentry.io/PROJECT_ID",
+    .transport = fanout_backend.transportConfig(),
+});
+defer client.deinit();
+```
 
 ## Crash Handling (POSIX)
 
