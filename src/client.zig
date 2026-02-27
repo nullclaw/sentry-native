@@ -3327,7 +3327,7 @@ test "Client captureLogMessage enriches sdk and scope log attributes" {
     try testing.expectEqual(@as(usize, 1), state.sent_count);
     try testing.expect(state.last_payload != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"sentry.sdk.name\":\"sentry-zig\"") != null);
-    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"sentry.sdk.version\":\"0.1.0\"") != null);
+    try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"sentry.sdk.version\":\"0.2.0\"") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, expected_parent_span) != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"user.id\":\"user-42\"") != null);
     try testing.expect(std.mem.indexOf(u8, state.last_payload.?, "\"user.name\":\"buyer\"") != null);

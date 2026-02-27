@@ -1324,7 +1324,7 @@ test "CJM e2e: structured log envelope is sent" {
     try testing.expect(relay.containsInAny("\"body\":\"checkout-log\""));
     try testing.expect(relay.containsInAny("\"level\":\"warn\""));
     try testing.expect(relay.containsInAny("\"sentry.sdk.name\":\"sentry-zig\""));
-    try testing.expect(relay.containsInAny("\"sentry.sdk.version\":\"0.1.0\""));
+    try testing.expect(relay.containsInAny("\"sentry.sdk.version\":\"0.2.0\""));
 }
 
 test "CJM e2e: active span propagation context is shared by events and logs" {

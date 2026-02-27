@@ -352,11 +352,11 @@ test "MockTransport.lastSent returns last sent item" {
 
 test "Transport init and deinit" {
     const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
-    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.1.0", .{});
+    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.2.0", .{});
     defer transport.deinit();
 
     try testing.expectEqualStrings("https://o0.ingest.sentry.io/api/1234567/envelope/?sentry_key=examplePublicKey", transport.envelope_url);
-    try testing.expectEqualStrings("sentry-zig/0.1.0", transport.user_agent);
+    try testing.expectEqualStrings("sentry-zig/0.2.0", transport.user_agent);
 }
 
 test "Transport stores custom user agent" {
@@ -379,7 +379,7 @@ test "MockTransport exposes configured rate limits" {
 
 test "Transport parses explicit http/https proxies" {
     const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
-    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.1.0", .{
+    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.2.0", .{
         .http_proxy = "http://proxy-http.local:8080",
         .https_proxy = "http://user:pass@proxy-https.local:8443",
     });
@@ -396,7 +396,7 @@ test "Transport parses explicit http/https proxies" {
 
 test "Transport stores accept_invalid_certs option" {
     const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
-    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.1.0", .{
+    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.2.0", .{
         .accept_invalid_certs = true,
     });
     defer transport.deinit();
@@ -406,7 +406,7 @@ test "Transport stores accept_invalid_certs option" {
 
 test "Transport send rejects insecure TLS mode when proxies are configured" {
     const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
-    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.1.0", .{
+    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.2.0", .{
         .accept_invalid_certs = true,
         .https_proxy = "http://proxy.local:8080",
     });
@@ -419,7 +419,7 @@ test "Transport init fails for invalid proxy URL" {
     const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
     try testing.expectError(
         error.InvalidProxyUrl,
-        Transport.init(testing.allocator, dsn, "sentry-zig/0.1.0", .{
+        Transport.init(testing.allocator, dsn, "sentry-zig/0.2.0", .{
             .http_proxy = "://invalid-proxy",
         }),
     );
@@ -427,7 +427,7 @@ test "Transport init fails for invalid proxy URL" {
 
 test "Transport ignores empty proxy strings" {
     const dsn = try Dsn.parse("https://examplePublicKey@o0.ingest.sentry.io/1234567");
-    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.1.0", .{
+    var transport = try Transport.init(testing.allocator, dsn, "sentry-zig/0.2.0", .{
         .http_proxy = "",
         .https_proxy = " \t",
     });

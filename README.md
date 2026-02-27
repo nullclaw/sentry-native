@@ -50,7 +50,7 @@ zig fetch --save git+https://github.com/nullclaw/sentry-zig.git
 For reproducible production builds, pin to a release tag:
 
 ```sh
-zig fetch --save https://github.com/nullclaw/sentry-zig/archive/refs/tags/v0.1.0.tar.gz
+zig fetch --save https://github.com/nullclaw/sentry-zig/archive/refs/tags/v0.2.0.tar.gz
 ```
 
 Import module in `build.zig`:
@@ -102,7 +102,7 @@ jobs:
 
 ## Versioning and Releases
 
-- Current stable release: `v0.1.0`
+- Current stable release: `v0.2.0`
 - Versioning policy: Semantic Versioning (SemVer)
 - Zig compatibility target: `>= 0.15.2` (older Zig versions are out of scope)
 - Use release tags for pinned dependencies and deterministic builds.
@@ -312,7 +312,7 @@ All options are provided via `sentry.Options` in `sentry.init`.
 | `max_request_body_size` | `?usize` | `null` | Drop envelopes larger than this byte size |
 | `enable_logs` | `bool` | `true` | Enable/disable structured log submissions |
 | `cache_dir` | `[]const u8` | `"/tmp/sentry-zig"` | Crash marker directory |
-| `user_agent` | `[]const u8` | `"sentry-zig/0.1.0"` | Transport User-Agent |
+| `user_agent` | `[]const u8` | `"sentry-zig/0.2.0"` | Transport User-Agent |
 | `install_signal_handlers` | `bool` | `true` | POSIX signal handler install |
 | `auto_session_tracking` | `bool` | `false` | Auto-start session on init |
 | `session_mode` | `SessionMode` | `.application` | `.application` / `.request` |
