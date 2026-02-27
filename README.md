@@ -148,7 +148,7 @@ jobs:
 | Signal crash marker flow | Implemented | POSIX marker write/read cycle |
 | Hub/TLS scope stack | Implemented | Push/pop scopes + TLS current hub helpers |
 | Structured logs pipeline | Implemented | `log` envelope items + `captureLogMessage` API |
-| Auto integration helpers | Implemented | Global init guard + std.log/panic/http/error helper integrations |
+| Auto integration helpers | Implemented | Global init guard + std.log/panic/http inbound+outbound/error/runtime helper integrations |
 | Extended integrations | Roadmap | Additional framework/runtime integrations will be added incrementally |
 
 ## Common Usage
@@ -313,8 +313,33 @@ req_ctx.finish(null);
 ```
 
 ```zig
+// Downstream HTTP helper: child span + propagation headers + status mapping
+var out = try sentry.integrations.http.OutgoingRequestContext.begin(.{
+    .method = "POST",
+    .url = "https://payments.example.com/charge",
+    .description = "POST payments charge",
+});
+defer out.deinit();
+
+var headers = try out.propagationHeadersAlloc(allocator);
+defer headers.deinit(allocator);
+// Attach headers.sentry_trace and headers.baggage to your outgoing HTTP request.
+
+out.setStatusCode(200);
+out.finish(null);
+```
+
+```zig
 // Error-return helper: captures returned errors automatically
 const value = try sentry.integrations.errors.runAndCapture(doWork, .{input});
+```
+
+```zig
+// Worker/task helper: clone current top scope into detached Hub and run code with TLS swap
+var detached = try sentry.integrations.runtime.DetachedHub.fromCurrent(allocator, client);
+defer detached.deinit();
+
+try detached.run(workerEntry, .{&detached});
 ```
 
 ## Configuration

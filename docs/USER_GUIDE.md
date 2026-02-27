@@ -207,6 +207,33 @@ Error path:
 _ = req_ctx.fail(error.DatabaseTimeout, 500);
 ```
 
+### Outgoing HTTP request integration helper
+
+Use `integrations.http.OutgoingRequestContext` inside an active transaction/span
+to create client spans and propagate trace headers downstream.
+
+```zig
+var out = try sentry.integrations.http.OutgoingRequestContext.begin(.{
+    .method = "POST",
+    .url = "https://payments.example.com/charge",
+    .description = "POST payments charge",
+});
+defer out.deinit();
+
+var headers = try out.propagationHeadersAlloc(allocator);
+defer headers.deinit(allocator);
+// Add headers.sentry_trace and headers.baggage to outgoing request headers.
+
+out.setStatusCode(200);
+out.finish(null);
+```
+
+Error path:
+
+```zig
+_ = out.fail(error.UpstreamTimeout, null); // defaults status_code to 500
+```
+
 ### Error-return integration helper
 
 Capture returned errors from error-union functions without changing control flow:
@@ -220,6 +247,18 @@ Direct wrapper variants:
 ```zig
 try sentry.integrations.errors.captureResult(doWork(input));
 try sentry.integrations.errors.captureResultAs(doWork(input), "DomainFailure");
+```
+
+### Worker/task runtime integration helper
+
+Use `integrations.runtime.DetachedHub` to clone the current top scope and run
+task code under the cloned Hub (with TLS current-Hub restore on exit).
+
+```zig
+var detached = try sentry.integrations.runtime.DetachedHub.fromCurrent(allocator, client);
+defer detached.deinit();
+
+const result = try detached.run(workerStep, .{input});
 ```
 
 ## Client Lifecycle

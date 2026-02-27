@@ -3,8 +3,10 @@ const testing = std.testing;
 
 const Client = @import("../client.zig").Client;
 const Hub = @import("../hub.zig").Hub;
+const Span = @import("../transaction.zig").Span;
 const Transaction = @import("../transaction.zig").Transaction;
 const TransactionOpts = @import("../transaction.zig").TransactionOpts;
+const TransactionOrSpan = @import("../transaction.zig").TransactionOrSpan;
 const SpanStatus = @import("../transaction.zig").SpanStatus;
 const SendOutcome = @import("../worker.zig").SendOutcome;
 
@@ -155,6 +157,146 @@ pub const RequestContext = struct {
     }
 };
 
+pub const OutgoingRequestOptions = struct {
+    op: []const u8 = "http.client",
+    description: ?[]const u8 = null,
+    method: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    query_string: ?[]const u8 = null,
+};
+
+pub const PropagationHeaders = struct {
+    sentry_trace: []u8,
+    baggage: []u8,
+
+    pub fn deinit(self: *PropagationHeaders, allocator: std.mem.Allocator) void {
+        allocator.free(self.sentry_trace);
+        allocator.free(self.baggage);
+        self.* = undefined;
+    }
+};
+
+/// Outbound request instrumentation context.
+///
+/// Requires an active current Hub with a bound transaction/span. `begin` creates
+/// a child span (`http.client` by default), binds it as current span, and allows
+/// generating propagation headers for downstream requests.
+pub const OutgoingRequestContext = struct {
+    hub: *Hub,
+    previous_span: TransactionOrSpan,
+    span: *Span,
+    finished: bool = false,
+    active: bool = true,
+    response_status_code: ?u16 = null,
+
+    pub fn begin(options: OutgoingRequestOptions) !OutgoingRequestContext {
+        const hub = Hub.current() orelse return error.NoCurrentHub;
+        const previous_span = hub.getSpan() orelse return error.NoActiveSpan;
+        const span = try previous_span.startChild(.{
+            .op = options.op,
+            .description = options.description,
+        });
+        errdefer span.finish();
+
+        if (options.method != null or options.url != null or options.query_string != null) {
+            span.setRequest(.{
+                .method = options.method,
+                .url = options.url,
+                .query_string = options.query_string,
+            }) catch {};
+        }
+
+        hub.setSpan(.{ .span = span });
+        return .{
+            .hub = hub,
+            .previous_span = previous_span,
+            .span = span,
+        };
+    }
+
+    pub fn setTag(self: *OutgoingRequestContext, key: []const u8, value: []const u8) void {
+        self.span.setTag(key, value) catch {};
+    }
+
+    pub fn setStatusCode(self: *OutgoingRequestContext, status_code: u16) void {
+        self.response_status_code = status_code;
+    }
+
+    pub fn captureError(self: *OutgoingRequestContext, err: anyerror) ?[32]u8 {
+        return self.hub.captureErrorId(err);
+    }
+
+    pub fn captureException(self: *OutgoingRequestContext, exception_type: []const u8, value: []const u8) ?[32]u8 {
+        return self.hub.captureExceptionId(exception_type, value);
+    }
+
+    pub fn sentryTraceHeaderAlloc(self: *OutgoingRequestContext, allocator: std.mem.Allocator) ![]u8 {
+        return self.span.sentryTraceHeaderAlloc(allocator);
+    }
+
+    pub fn baggageHeaderAlloc(self: *OutgoingRequestContext, allocator: std.mem.Allocator) ![]u8 {
+        return self.hub.baggageHeader(self.span.owner, allocator);
+    }
+
+    pub fn propagationHeadersAlloc(self: *OutgoingRequestContext, allocator: std.mem.Allocator) !PropagationHeaders {
+        const sentry_trace = try self.sentryTraceHeaderAlloc(allocator);
+        errdefer allocator.free(sentry_trace);
+
+        const baggage = try self.baggageHeaderAlloc(allocator);
+        return .{
+            .sentry_trace = sentry_trace,
+            .baggage = baggage,
+        };
+    }
+
+    pub fn finish(self: *OutgoingRequestContext, status_code_override: ?u16) void {
+        if (self.finished) return;
+
+        const status_code = status_code_override orelse self.response_status_code;
+        if (status_code) |code| {
+            self.span.setStatus(spanStatusFromHttpStatus(code));
+            self.span.setData("status_code", .{ .integer = @as(i64, code) }) catch {};
+        }
+        self.span.finish();
+        self.finished = true;
+
+        if (self.isCurrentSpan()) {
+            self.hub.setSpan(self.previous_span);
+        }
+    }
+
+    pub fn fail(self: *OutgoingRequestContext, err: anyerror, status_code_override: ?u16) ?[32]u8 {
+        const event_id = self.captureError(err);
+        if (status_code_override == null and self.response_status_code == null) {
+            self.response_status_code = 500;
+        }
+        self.finish(status_code_override);
+        return event_id;
+    }
+
+    pub fn deinit(self: *OutgoingRequestContext) void {
+        if (!self.active) return;
+        self.active = false;
+
+        if (!self.finished) {
+            self.finish(null);
+            return;
+        }
+
+        if (self.isCurrentSpan()) {
+            self.hub.setSpan(self.previous_span);
+        }
+    }
+
+    fn isCurrentSpan(self: *const OutgoingRequestContext) bool {
+        const current = self.hub.getSpan() orelse return false;
+        return switch (current) {
+            .span => |value| value == self.span,
+            .transaction => false,
+        };
+    }
+};
+
 pub fn spanStatusFromHttpStatus(status_code: u16) SpanStatus {
     return switch (status_code) {
         401 => .unauthenticated,
@@ -271,4 +413,163 @@ test "RequestContext begin/finish captures transaction with propagated trace and
 
     try testing.expect(saw_transaction);
     try testing.expect(saw_error_event);
+}
+
+test "OutgoingRequestContext creates child span with propagation headers and restores previous span" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    var txn = hub.startTransaction(.{
+        .name = "GET /checkout",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+    hub.setSpan(.{ .transaction = &txn });
+
+    var out = try OutgoingRequestContext.begin(.{
+        .method = "POST",
+        .url = "https://payments.example.com/charge",
+        .description = "POST payments charge",
+    });
+    defer out.deinit();
+
+    const current_span = hub.getSpan().?;
+    try testing.expect(switch (current_span) {
+        .span => |value| value == out.span,
+        .transaction => false,
+    });
+
+    var headers = try out.propagationHeadersAlloc(testing.allocator);
+    defer headers.deinit(testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, headers.sentry_trace, txn.trace_id[0..]) != null);
+    try testing.expect(std.mem.indexOf(u8, headers.sentry_trace, out.span.span_id[0..]) != null);
+    try testing.expect(std.mem.indexOf(u8, headers.baggage, "sentry-trace_id=") != null);
+
+    out.setTag("peer.service", "payments");
+    out.setStatusCode(503);
+    out.finish(null);
+
+    const restored = hub.getSpan().?;
+    try testing.expect(switch (restored) {
+        .transaction => |value| value == &txn,
+        .span => false,
+    });
+
+    hub.finishTransaction(&txn);
+    hub.setSpan(null);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 1);
+
+    var saw_transaction = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") != null) {
+            saw_transaction = true;
+            try testing.expect(std.mem.indexOf(u8, payload, "\"op\":\"http.client\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"description\":\"POST payments charge\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"status\":\"unavailable\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"method\":\"POST\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"url\":\"https://payments.example.com/charge\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"status_code\":503") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"peer.service\":\"payments\"") != null);
+        }
+    }
+    try testing.expect(saw_transaction);
+}
+
+test "OutgoingRequestContext fail captures error and defaults HTTP status to 500" {
+    var payload_state = PayloadState{ .allocator = testing.allocator };
+    defer payload_state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .transport = .{
+            .send_fn = payloadSendFn,
+            .ctx = &payload_state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    var txn = hub.startTransaction(.{
+        .name = "POST /checkout",
+        .op = "http.server",
+    });
+    defer txn.deinit();
+    hub.setSpan(.{ .transaction = &txn });
+
+    var out = try OutgoingRequestContext.begin(.{
+        .method = "POST",
+        .url = "https://inventory.example.com/reserve",
+    });
+    defer out.deinit();
+
+    const event_id = out.fail(error.OutgoingDependencyTimeout, null);
+    try testing.expect(event_id != null);
+
+    hub.finishTransaction(&txn);
+    hub.setSpan(null);
+
+    try testing.expect(client.flush(1000));
+    try testing.expect(payload_state.payloads.items.len >= 2);
+
+    var saw_transaction = false;
+    var saw_error_event = false;
+    for (payload_state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"transaction\"") != null) {
+            saw_transaction = true;
+            try testing.expect(std.mem.indexOf(u8, payload, "\"op\":\"http.client\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"status\":\"internal_error\"") != null);
+            try testing.expect(std.mem.indexOf(u8, payload, "\"status_code\":500") != null);
+        }
+        if (std.mem.indexOf(u8, payload, "\"type\":\"event\"") != null and
+            std.mem.indexOf(u8, payload, "OutgoingDependencyTimeout") != null)
+        {
+            saw_error_event = true;
+        }
+    }
+
+    try testing.expect(saw_transaction);
+    try testing.expect(saw_error_event);
+}
+
+test "OutgoingRequestContext begin requires current hub and active span" {
+    try testing.expectError(error.NoCurrentHub, OutgoingRequestContext.begin(.{}));
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .traces_sample_rate = 1.0,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var hub = try Hub.init(testing.allocator, client);
+    defer hub.deinit();
+    _ = Hub.setCurrent(&hub);
+    defer _ = Hub.clearCurrent();
+
+    try testing.expect(hub.getSpan() == null);
+    try testing.expectError(error.NoActiveSpan, OutgoingRequestContext.begin(.{}));
 }
