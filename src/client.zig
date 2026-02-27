@@ -1650,6 +1650,7 @@ pub const Client = struct {
 
     fn startSessionAggregateFlusher(self: *Client) void {
         if (self.options.session_mode != .request) return;
+        if (self.options.session_aggregate_flush_interval_ms == 0) return;
 
         self.session_flush_mutex.lock();
         defer self.session_flush_mutex.unlock();
@@ -1674,10 +1675,11 @@ pub const Client = struct {
 
     fn sessionAggregateFlusherLoop(self: *Client) void {
         const interval_ns_i128 = self.sessionAggregateFlushIntervalNs();
+        const max_wait_ns: u64 = @intCast(std.math.maxInt(i64));
         const interval_ns: u64 = if (interval_ns_i128 <= 0)
             1
-        else if (interval_ns_i128 >= std.math.maxInt(u64))
-            std.math.maxInt(u64)
+        else if (interval_ns_i128 >= max_wait_ns)
+            max_wait_ns
         else
             @as(u64, @intCast(interval_ns_i128));
 
@@ -1788,66 +1790,106 @@ pub const Client = struct {
         const release = self.options.release orelse return false;
         const environment = self.options.environment orelse "production";
 
+        var sent_prefix: usize = 0;
+        while (sent_prefix < self.session_aggregates.items.len) {
+            const batch_end = @min(
+                sent_prefix + MAX_SESSION_AGGREGATE_BUCKETS,
+                self.session_aggregates.items.len,
+            );
+            const batch = self.session_aggregates.items[sent_prefix..batch_end];
+
+            const envelope_data = self.serializeSessionAggregatesBatchEnvelope(
+                release,
+                environment,
+                batch,
+            ) catch {
+                self.dropSessionAggregatePrefixLocked(sent_prefix);
+                return false;
+            };
+
+            if (!self.submitEnvelope(envelope_data, .session)) {
+                self.dropSessionAggregatePrefixLocked(sent_prefix);
+                return false;
+            }
+
+            sent_prefix = batch_end;
+        }
+
+        self.dropSessionAggregatePrefixLocked(sent_prefix);
+        return true;
+    }
+
+    fn serializeSessionAggregatesBatchEnvelope(
+        self: *Client,
+        release: []const u8,
+        environment: []const u8,
+        buckets: []const SessionAggregateBucket,
+    ) ![]u8 {
         var payload_writer: Writer.Allocating = .init(self.allocator);
         defer payload_writer.deinit();
 
         const writer = &payload_writer.writer;
-        writer.writeAll("{\"aggregates\":[") catch return false;
+        try writer.writeAll("{\"aggregates\":[");
 
-        for (self.session_aggregates.items, 0..) |bucket, index| {
-            if (index > 0) writer.writeByte(',') catch return false;
+        for (buckets, 0..) |bucket, index| {
+            if (index > 0) try writer.writeByte(',');
 
-            writer.writeByte('{') catch return false;
-            writer.writeAll("\"started\":\"") catch return false;
-            const started_ms: u64 = @intCast(bucket.started_minute_unix * 1000);
+            try writer.writeByte('{');
+            try writer.writeAll("\"started\":\"");
+            const started_minute_unix = if (bucket.started_minute_unix < 0) @as(i64, 0) else bucket.started_minute_unix;
+            const started_ms: u64 = @intCast(started_minute_unix * 1000);
             const started_rfc = ts.formatRfc3339(started_ms);
-            writer.writeAll(&started_rfc) catch return false;
-            writer.writeByte('"') catch return false;
+            try writer.writeAll(&started_rfc);
+            try writer.writeByte('"');
 
             if (bucket.did) |did| {
-                writer.writeAll(",\"did\":") catch return false;
-                json.Stringify.value(did, .{}, writer) catch return false;
+                try writer.writeAll(",\"did\":");
+                try json.Stringify.value(did, .{}, writer);
             }
-            if (bucket.exited > 0) writer.print(",\"exited\":{d}", .{bucket.exited}) catch return false;
-            if (bucket.errored > 0) writer.print(",\"errored\":{d}", .{bucket.errored}) catch return false;
-            if (bucket.abnormal > 0) writer.print(",\"abnormal\":{d}", .{bucket.abnormal}) catch return false;
-            if (bucket.crashed > 0) writer.print(",\"crashed\":{d}", .{bucket.crashed}) catch return false;
+            if (bucket.exited > 0) try writer.print(",\"exited\":{d}", .{bucket.exited});
+            if (bucket.errored > 0) try writer.print(",\"errored\":{d}", .{bucket.errored});
+            if (bucket.abnormal > 0) try writer.print(",\"abnormal\":{d}", .{bucket.abnormal});
+            if (bucket.crashed > 0) try writer.print(",\"crashed\":{d}", .{bucket.crashed});
 
-            writer.writeByte('}') catch return false;
+            try writer.writeByte('}');
         }
 
-        writer.writeAll("],\"attrs\":{\"release\":") catch return false;
-        json.Stringify.value(release, .{}, writer) catch return false;
-        writer.writeAll(",\"environment\":") catch return false;
-        json.Stringify.value(environment, .{}, writer) catch return false;
-        writer.writeAll("}}") catch return false;
+        try writer.writeAll("],\"attrs\":{\"release\":");
+        try json.Stringify.value(release, .{}, writer);
+        try writer.writeAll(",\"environment\":");
+        try json.Stringify.value(environment, .{}, writer);
+        try writer.writeAll("}}");
 
-        const aggregates_json = payload_writer.toOwnedSlice() catch return false;
+        const aggregates_json = try payload_writer.toOwnedSlice();
         defer self.allocator.free(aggregates_json);
 
         var envelope_writer: Writer.Allocating = .init(self.allocator);
-        envelope.serializeSessionAggregatesEnvelope(self.dsn, aggregates_json, &envelope_writer.writer) catch {
-            envelope_writer.deinit();
-            return false;
-        };
-        const envelope_data = envelope_writer.toOwnedSlice() catch {
-            envelope_writer.deinit();
-            return false;
-        };
+        errdefer envelope_writer.deinit();
+        try envelope.serializeSessionAggregatesEnvelope(self.dsn, aggregates_json, &envelope_writer.writer);
+        return try envelope_writer.toOwnedSlice();
+    }
 
-        if (!self.submitEnvelope(envelope_data, .session)) {
-            return false;
+    fn dropSessionAggregatePrefixLocked(self: *Client, prefix_len: usize) void {
+        if (prefix_len == 0) return;
+
+        const drop_len = @min(prefix_len, self.session_aggregates.items.len);
+        for (self.session_aggregates.items[0..drop_len]) |bucket| {
+            if (bucket.did) |did| self.allocator.free(did);
         }
 
-        self.clearSessionAggregatesLocked();
-        return true;
+        const remaining = self.session_aggregates.items.len - drop_len;
+        if (remaining > 0) {
+            std.mem.copyForwards(
+                SessionAggregateBucket,
+                self.session_aggregates.items[0..remaining],
+                self.session_aggregates.items[drop_len..],
+            );
+        }
+        self.session_aggregates.items.len = remaining;
     }
 
     fn clearSessionAggregatesLocked(self: *Client) void {
-        for (self.session_aggregates.items) |bucket| {
-            if (bucket.did) |did| self.allocator.free(did);
-        }
-        self.session_aggregates.clearRetainingCapacity();
+        self.dropSessionAggregatePrefixLocked(self.session_aggregates.items.len);
     }
 
     fn deinitSessionAggregates(self: *Client) void {
@@ -4349,6 +4391,76 @@ test "Client request session mode accepts very large aggregate flush interval" {
     _ = client.flush(1000);
 
     try testing.expect(state.count.load(.seq_cst) > 0);
+}
+
+test "Client request session mode allows disabling aggregate interval flusher" {
+    var state = AtomicCountTransportState{};
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
+        .session_mode = .request,
+        .session_aggregate_flush_interval_ms = 0,
+        .transport = .{
+            .send_fn = atomicCountTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    client.startSession();
+    client.endSession(.exited);
+
+    std.Thread.sleep(80 * std.time.ns_per_ms);
+    try testing.expectEqual(@as(usize, 0), state.count.load(.seq_cst));
+
+    _ = client.flush(1000);
+    try testing.expect(state.count.load(.seq_cst) > 0);
+}
+
+test "Client request session mode flushes aggregates in multiple envelopes without duplicates" {
+    var state = MultiPayloadTransportState.init(testing.allocator);
+    defer state.deinit();
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .release = "my-app@1.0.0",
+        .session_mode = .request,
+        .session_aggregate_flush_interval_ms = 0,
+        .transport = .{
+            .send_fn = multiPayloadTransportSendFn,
+            .ctx = &state,
+        },
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var i: usize = 0;
+    while (i < (MAX_SESSION_AGGREGATE_BUCKETS * 2 + 5)) : (i += 1) {
+        var user_id_buffer: [32]u8 = undefined;
+        const user_id = try std.fmt.bufPrint(&user_id_buffer, "user-{d}", .{i});
+        client.setUser(.{ .id = user_id });
+        client.startSession();
+        client.endSession(.exited);
+    }
+
+    _ = client.flush(2000);
+
+    var sessions_payload_count: usize = 0;
+    var exited_bucket_count: usize = 0;
+    for (state.payloads.items) |payload| {
+        if (std.mem.indexOf(u8, payload, "\"type\":\"sessions\"") == null) continue;
+        sessions_payload_count += 1;
+        var search_index: usize = 0;
+        while (std.mem.indexOfPos(u8, payload, search_index, "\"exited\":1")) |pos| {
+            exited_bucket_count += 1;
+            search_index = pos + "\"exited\":1".len;
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 3), sessions_payload_count);
+    try testing.expectEqual(@as(usize, MAX_SESSION_AGGREGATE_BUCKETS * 2 + 5), exited_bucket_count);
 }
 
 test "Client session distinct id uses scope user id" {
