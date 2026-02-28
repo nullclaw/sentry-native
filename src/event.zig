@@ -42,6 +42,7 @@ pub const Frame = struct {
     filename: ?[]const u8 = null,
     function: ?[]const u8 = null,
     module: ?[]const u8 = null,
+    package: ?[]const u8 = null,
     lineno: ?u32 = null,
     colno: ?u32 = null,
     abs_path: ?[]const u8 = null,

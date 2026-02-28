@@ -1244,6 +1244,9 @@ pub const Client = struct {
 
                 var stacktrace_has_in_app = false;
                 for (frames_copy) |*frame| {
+                    if (ensureFramePackageFromFunction(frame)) {
+                        any_modified = true;
+                    }
                     if (frame.in_app) |in_app| {
                         if (in_app) stacktrace_has_in_app = true;
                         continue;
@@ -1304,6 +1307,9 @@ pub const Client = struct {
         var any_modified = false;
         var stacktrace_has_in_app = false;
         for (frames_copy) |*frame| {
+            if (ensureFramePackageFromFunction(frame)) {
+                any_modified = true;
+            }
             if (frame.in_app) |in_app| {
                 if (in_app) stacktrace_has_in_app = true;
                 continue;
@@ -1363,6 +1369,9 @@ pub const Client = struct {
             var stacktrace_has_in_app = false;
             for (frames_ptr.array.items) |*frame_value| {
                 if (frame_value.* != .object) continue;
+                if (try ensureThreadFramePackage(allocator, &frame_value.object)) {
+                    any_modified = true;
+                }
 
                 const existing_in_app = frame_value.object.getPtr("in_app");
                 if (existing_in_app) |in_app_ptr| {
@@ -1436,6 +1445,38 @@ pub const Client = struct {
             .string => |str| str,
             else => null,
         };
+    }
+
+    fn parsePackageFromFunction(function: []const u8) ?[]const u8 {
+        const separator = std.mem.indexOf(u8, function, "::") orelse return null;
+        if (separator == 0) return null;
+        return function[0..separator];
+    }
+
+    fn ensureFramePackageFromFunction(frame: *Frame) bool {
+        if (frame.package != null) return false;
+        const function = frame.function orelse return false;
+        const package = parsePackageFromFunction(function) orelse return false;
+        frame.package = package;
+        return true;
+    }
+
+    fn ensureThreadFramePackage(allocator: Allocator, frame_object: *json.ObjectMap) !bool {
+        const existing_package = frame_object.getPtr("package");
+        if (existing_package) |package_ptr| {
+            if (package_ptr.* != .null) return false;
+        }
+
+        const function = jsonStringField(frame_object.get("function")) orelse return false;
+        const package = parsePackageFromFunction(function) orelse return false;
+
+        if (existing_package) |package_ptr| {
+            const copy = try allocator.dupe(u8, package);
+            package_ptr.* = .{ .string = copy };
+        } else {
+            try putOwnedString(allocator, frame_object, "package", package);
+        }
+        return true;
     }
 
     fn inferInApp(
@@ -2990,6 +3031,43 @@ fn firstEventStacktraceFrameInApp(event: *const Event) ?bool {
     return stacktrace.frames[0].in_app;
 }
 
+fn firstExceptionFramePackage(event: *const Event) ?[]const u8 {
+    const exception = event.exception orelse return null;
+    if (exception.values.len == 0) return null;
+    const stacktrace = exception.values[0].stacktrace orelse return null;
+    if (stacktrace.frames.len == 0) return null;
+    return stacktrace.frames[0].package;
+}
+
+fn firstEventStacktraceFramePackage(event: *const Event) ?[]const u8 {
+    const stacktrace = event.stacktrace orelse return null;
+    if (stacktrace.frames.len == 0) return null;
+    return stacktrace.frames[0].package;
+}
+
+fn firstThreadFramePackage(event: *const Event) ?[]const u8 {
+    const threads = event.threads orelse return null;
+    if (threads != .object) return null;
+
+    const values = threads.object.get("values") orelse return null;
+    if (values != .array or values.array.items.len == 0) return null;
+
+    const first_thread = values.array.items[0];
+    if (first_thread != .object) return null;
+    const stacktrace = first_thread.object.get("stacktrace") orelse return null;
+    if (stacktrace != .object) return null;
+    const frames = stacktrace.object.get("frames") orelse return null;
+    if (frames != .array or frames.array.items.len == 0) return null;
+
+    const first_frame = frames.array.items[0];
+    if (first_frame != .object) return null;
+    const package = first_frame.object.get("package") orelse return null;
+    return switch (package) {
+        .string => |value| value,
+        else => null,
+    };
+}
+
 fn hasDebugMetaImages(event: *const Event) bool {
     const debug_meta = event.debug_meta orelse return false;
     if (debug_meta != .object) return false;
@@ -3009,6 +3087,10 @@ var before_send_debug_meta_custom_preserved: bool = false;
 var before_send_first_frame_in_app: ?bool = null;
 var before_send_first_thread_frame_in_app: ?bool = null;
 var before_send_first_event_stacktrace_frame_in_app: ?bool = null;
+var expected_frame_package: ?[]const u8 = null;
+var before_send_exception_frame_package_matches_expected: bool = false;
+var before_send_event_stacktrace_frame_package_matches_expected: bool = false;
+var before_send_thread_frame_package_matches_expected: bool = false;
 var before_send_observed_server_name: ?[]const u8 = null;
 var before_send_observed_dist: ?[]const u8 = null;
 var before_send_observed_platform: ?[]const u8 = null;
@@ -3101,11 +3183,17 @@ fn inspectMergedDebugMetaBeforeSend(event: *Event) ?*Event {
 
 fn inspectInAppBeforeSend(event: *Event) ?*Event {
     before_send_first_frame_in_app = null;
+    before_send_exception_frame_package_matches_expected = false;
     if (event.exception) |exception| {
         if (exception.values.len > 0) {
             if (exception.values[0].stacktrace) |stacktrace| {
                 if (stacktrace.frames.len > 0) {
                     before_send_first_frame_in_app = stacktrace.frames[0].in_app;
+                    if (expected_frame_package) |expected| {
+                        if (stacktrace.frames[0].package) |package| {
+                            before_send_exception_frame_package_matches_expected = std.mem.eql(u8, package, expected);
+                        }
+                    }
                 }
             }
         }
@@ -3115,11 +3203,23 @@ fn inspectInAppBeforeSend(event: *Event) ?*Event {
 
 fn inspectThreadInAppBeforeSend(event: *Event) ?*Event {
     before_send_first_thread_frame_in_app = firstThreadFrameInApp(event);
+    before_send_thread_frame_package_matches_expected = false;
+    if (expected_frame_package) |expected| {
+        if (firstThreadFramePackage(event)) |package| {
+            before_send_thread_frame_package_matches_expected = std.mem.eql(u8, package, expected);
+        }
+    }
     return event;
 }
 
 fn inspectEventStacktraceInAppBeforeSend(event: *Event) ?*Event {
     before_send_first_event_stacktrace_frame_in_app = firstEventStacktraceFrameInApp(event);
+    before_send_event_stacktrace_frame_package_matches_expected = false;
+    if (expected_frame_package) |expected| {
+        if (firstEventStacktraceFramePackage(event)) |package| {
+            before_send_event_stacktrace_frame_package_matches_expected = std.mem.eql(u8, package, expected);
+        }
+    }
     return event;
 }
 
@@ -3637,6 +3737,34 @@ test "Client in_app_exclude marks matching exception frames as in_app=false" {
     try testing.expectEqual(@as(?bool, false), before_send_first_frame_in_app);
 }
 
+test "Client default integrations derive exception frame package from function" {
+    expected_frame_package = "my_crate";
+    defer expected_frame_package = null;
+    before_send_exception_frame_package_matches_expected = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = true,
+        .before_send = inspectInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{.{
+        .function = "my_crate::checkout::execute",
+    }};
+    const values = [_]ExceptionValue{.{
+        .type = "CheckoutError",
+        .value = "declined",
+        .stacktrace = Stacktrace{ .frames = &frames },
+    }};
+    var event = Event.initException(&values);
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expect(before_send_exception_frame_package_matches_expected);
+    try testing.expectEqual(@as(?[]const u8, null), frames[0].package);
+}
+
 test "Client in_app_include marks matching thread frames without mutating input event" {
     before_send_first_thread_frame_in_app = null;
 
@@ -3678,6 +3806,49 @@ test "Client in_app_include marks matching thread frames without mutating input 
     try testing.expect(client.captureEventId(&event) != null);
     try testing.expectEqual(@as(?bool, true), before_send_first_thread_frame_in_app);
     try testing.expectEqual(@as(?bool, null), firstThreadFrameInApp(&event));
+}
+
+test "Client default integrations derive thread frame package from function without mutating input event" {
+    expected_frame_package = "worker";
+    defer expected_frame_package = null;
+    before_send_thread_frame_package_matches_expected = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = true,
+        .before_send = inspectThreadInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    var frame_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedString(testing.allocator, &frame_object, "function", "worker::loop::run");
+
+    var frames_array = json.Array.init(testing.allocator);
+    try frames_array.append(.{ .object = frame_object });
+
+    var stacktrace_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedJsonEntry(testing.allocator, &stacktrace_object, "frames", .{ .array = frames_array });
+
+    var thread_object = json.ObjectMap.init(testing.allocator);
+    try Client.putOwnedJsonEntry(testing.allocator, &thread_object, "stacktrace", .{ .object = stacktrace_object });
+
+    var values_array = json.Array.init(testing.allocator);
+    try values_array.append(.{ .object = thread_object });
+
+    var threads_object = json.ObjectMap.init(testing.allocator);
+    defer {
+        var owned_threads: json.Value = .{ .object = threads_object };
+        scope_mod.deinitJsonValueDeep(testing.allocator, &owned_threads);
+    }
+    try Client.putOwnedJsonEntry(testing.allocator, &threads_object, "values", .{ .array = values_array });
+
+    var event = Event.initMessage("thread-stacktrace-package", .info);
+    event.threads = .{ .object = threads_object };
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expect(before_send_thread_frame_package_matches_expected);
+    try testing.expectEqual(@as(?[]const u8, null), firstThreadFramePackage(&event));
 }
 
 test "Client in_app fallback marks exception frames as true when no frame is in_app" {
@@ -3773,6 +3944,30 @@ test "Client in_app_include marks matching event stacktrace frames without mutat
     try testing.expect(client.captureEventId(&event) != null);
     try testing.expectEqual(@as(?bool, true), before_send_first_event_stacktrace_frame_in_app);
     try testing.expectEqual(@as(?bool, null), frames[0].in_app);
+}
+
+test "Client default integrations derive event stacktrace frame package from function" {
+    expected_frame_package = "checkout";
+    defer expected_frame_package = null;
+    before_send_event_stacktrace_frame_package_matches_expected = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = true,
+        .before_send = inspectEventStacktraceInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{.{
+        .function = "checkout::pipeline::run",
+    }};
+    var event = Event.initMessage("event-stacktrace-package", .info);
+    event.stacktrace = .{ .frames = &frames };
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expect(before_send_event_stacktrace_frame_package_matches_expected);
+    try testing.expectEqual(@as(?[]const u8, null), frames[0].package);
 }
 
 test "Client in_app fallback marks event stacktrace frames as true when unresolved" {
