@@ -753,6 +753,9 @@ When `server_name` is unset and `default_integrations = true`, the SDK attempts 
 - `HTTPS_PROXY` / `https_proxy`
 - `SSL_VERIFY` (`false` enables `accept_invalid_certs`)
 
+`SSL_VERIFY` always overrides explicit `accept_invalid_certs` in env-default init.
+Unknown `SSL_VERIFY` values are treated as `true` (certificate verification enabled).
+
 When no explicit `environment` and no `SENTRY_ENVIRONMENT` are provided,
 env-default initialization sets:
 - `"development"` for debug builds

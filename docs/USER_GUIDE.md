@@ -669,6 +669,9 @@ If `Options.integrations` is provided, each integration setup callback runs duri
 - `HTTPS_PROXY` / `https_proxy`
 - `SSL_VERIFY` (`false` enables `accept_invalid_certs`)
 
+`SSL_VERIFY` always overrides explicit `accept_invalid_certs` in env-default init.
+Unknown `SSL_VERIFY` values are treated as `true` (certificate verification enabled).
+
 If `environment` is still missing after env resolution, env-default init sets:
 - `"development"` for debug builds
 - `"production"` for non-debug builds

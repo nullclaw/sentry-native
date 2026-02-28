@@ -1962,12 +1962,8 @@ pub const Client = struct {
             }
         }
 
-        if (!options.accept_invalid_certs) {
-            if (env_map.get("SSL_VERIFY")) |value| {
-                if (parseEnvBool(value)) |verify| {
-                    options.accept_invalid_certs = !verify;
-                }
-            }
+        if (env_map.get("SSL_VERIFY")) |value| {
+            options.accept_invalid_certs = !parseSslVerifyLikeRust(value);
         }
     }
 
@@ -2039,6 +2035,14 @@ pub const Client = struct {
         if (std.ascii.eqlIgnoreCase(trimmed, "no")) return false;
         if (std.ascii.eqlIgnoreCase(trimmed, "off")) return false;
         return null;
+    }
+
+    fn parseSslVerifyLikeRust(value: []const u8) bool {
+        // Match rust `SSL_VERIFY` behavior:
+        // `accept_invalid_certs = !env.parse::<bool>().unwrap_or(true)`.
+        if (std.mem.eql(u8, value, "true")) return true;
+        if (std.mem.eql(u8, value, "false")) return false;
+        return true;
     }
 
     fn defaultEnvironmentName() []const u8 {
@@ -2239,6 +2243,57 @@ test "applyEnvDefaultsFromMap sets default environment and https_proxy fallback 
     try testing.expectEqualStrings(Client.defaultEnvironmentName(), opts.environment.?);
     try testing.expectEqualStrings("http://proxy.example.com:8080", opts.http_proxy.?);
     try testing.expectEqualStrings("http://proxy.example.com:8080", opts.https_proxy.?);
+}
+
+test "applyEnvDefaultsFromMap SSL_VERIFY overrides explicit accept_invalid_certs" {
+    var env_map = std.process.EnvMap.init(testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("SSL_VERIFY", "true");
+
+    var opts = Options{
+        .dsn = "https://explicitPublicKey@o0.ingest.sentry.io/1234567",
+        .accept_invalid_certs = true,
+        .install_signal_handlers = false,
+    };
+    var owned: OwnedOptionStrings = .{};
+    defer owned.deinit(testing.allocator);
+
+    try Client.applyEnvDefaultsFromMap(testing.allocator, &opts, &owned, &env_map);
+    try testing.expect(!opts.accept_invalid_certs);
+}
+
+test "applyEnvDefaultsFromMap invalid SSL_VERIFY falls back to verify=true" {
+    var env_map = std.process.EnvMap.init(testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("SSL_VERIFY", "invalid-value");
+
+    var opts = Options{
+        .dsn = "https://explicitPublicKey@o0.ingest.sentry.io/1234567",
+        .accept_invalid_certs = true,
+        .install_signal_handlers = false,
+    };
+    var owned: OwnedOptionStrings = .{};
+    defer owned.deinit(testing.allocator);
+
+    try Client.applyEnvDefaultsFromMap(testing.allocator, &opts, &owned, &env_map);
+    try testing.expect(!opts.accept_invalid_certs);
+}
+
+test "applyEnvDefaultsFromMap whitespace SSL_VERIFY is invalid and falls back to verify=true" {
+    var env_map = std.process.EnvMap.init(testing.allocator);
+    defer env_map.deinit();
+    try env_map.put("SSL_VERIFY", " false ");
+
+    var opts = Options{
+        .dsn = "https://explicitPublicKey@o0.ingest.sentry.io/1234567",
+        .accept_invalid_certs = true,
+        .install_signal_handlers = false,
+    };
+    var owned: OwnedOptionStrings = .{};
+    defer owned.deinit(testing.allocator);
+
+    try Client.applyEnvDefaultsFromMap(testing.allocator, &opts, &owned, &env_map);
+    try testing.expect(!opts.accept_invalid_certs);
 }
 
 test "Client struct size is non-zero" {
