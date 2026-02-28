@@ -104,20 +104,29 @@ pub fn parseHeaders(headers: []const PropagationHeader) ?SentryTrace {
 pub fn parsePropagationHeaders(headers: []const PropagationHeader) ParsedPropagationHeaders {
     var parsed: ParsedPropagationHeaders = .{};
     for (headers) |header| {
-        const name = std.mem.trim(u8, header.name, " \t");
-        if (parsed.sentry_trace_header == null and std.ascii.eqlIgnoreCase(name, "sentry-trace")) {
-            parsed.sentry_trace_header = header.value;
-            continue;
-        }
-        if (parsed.baggage_header == null and std.ascii.eqlIgnoreCase(name, "baggage")) {
-            parsed.baggage_header = header.value;
-            continue;
-        }
-        if (parsed.traceparent_header == null and std.ascii.eqlIgnoreCase(name, "traceparent")) {
-            parsed.traceparent_header = header.value;
-        }
+        applyPropagationHeaderPair(&parsed, header.name, header.value);
     }
     return parsed;
+}
+
+/// Apply one `(name, value)` header pair to parsed propagation state.
+pub fn applyPropagationHeaderPair(
+    parsed: *ParsedPropagationHeaders,
+    raw_name: []const u8,
+    value: []const u8,
+) void {
+    const name = std.mem.trim(u8, raw_name, " \t");
+    if (parsed.sentry_trace_header == null and std.ascii.eqlIgnoreCase(name, "sentry-trace")) {
+        parsed.sentry_trace_header = value;
+        return;
+    }
+    if (parsed.baggage_header == null and std.ascii.eqlIgnoreCase(name, "baggage")) {
+        parsed.baggage_header = value;
+        return;
+    }
+    if (parsed.traceparent_header == null and std.ascii.eqlIgnoreCase(name, "traceparent")) {
+        parsed.traceparent_header = value;
+    }
 }
 
 /// Parse W3C `traceparent` header.
@@ -499,6 +508,20 @@ test "parsePropagationHeaders extracts known headers case-insensitively" {
         parsed.sentry_trace_header.?,
     );
     try testing.expect(std.mem.startsWith(u8, parsed.traceparent_header.?, "00-"));
+}
+
+test "applyPropagationHeaderPair updates parsed fields with first-match semantics" {
+    var parsed: ParsedPropagationHeaders = .{};
+    applyPropagationHeaderPair(&parsed, "sentry-trace", "trace-first");
+    applyPropagationHeaderPair(&parsed, "SENTRY-TRACE", "trace-second");
+    applyPropagationHeaderPair(&parsed, "baggage", "bag-first");
+    applyPropagationHeaderPair(&parsed, "BAGGAGE", "bag-second");
+    applyPropagationHeaderPair(&parsed, "traceparent", "tp-first");
+    applyPropagationHeaderPair(&parsed, "TRaceParent", "tp-second");
+
+    try testing.expectEqualStrings("trace-first", parsed.sentry_trace_header.?);
+    try testing.expectEqualStrings("bag-first", parsed.baggage_header.?);
+    try testing.expectEqualStrings("tp-first", parsed.traceparent_header.?);
 }
 
 test "parseTraceParent parses valid header" {

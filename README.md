@@ -155,7 +155,7 @@ jobs:
 | Signal crash marker flow | Implemented | POSIX marker write/read cycle |
 | Hub/TLS scope stack | Implemented | Push/pop scopes + TLS current hub helpers |
 | Structured logs pipeline | Implemented | `log` envelope items + `captureLogMessage` API |
-| Auto integration helpers | Implemented | Global init guard + std.log/panic/http inbound+outbound/error/runtime helper integrations + OTel traceparent helper API |
+| Auto integration helpers | Implemented | Global init guard + std.log/panic/http inbound+outbound/error/runtime helper integrations + OTel traceparent helper API + std.http adapter |
 | Extended integrations | Roadmap | Additional framework/runtime integrations will be added incrementally |
 
 ## Common Usage
@@ -463,6 +463,26 @@ const status = try sentry.integrations.auto.runIncomingRequestFromHeadersWithCur
         .url = "https://api.example.com/orders/42",
     },
     &incoming_headers,
+    incomingHandler,
+    handler_ctx,
+    .{},
+);
+_ = status;
+```
+
+```zig
+// std.http adapter: map std.http method/target/headers to Sentry request instrumentation
+const std_headers = [_]std.http.Header{
+    .{ .name = "traceparent", .value = incoming_traceparent_header },
+    .{ .name = "baggage", .value = incoming_baggage_header },
+};
+const status = try sentry.integrations.std_http.runIncomingRequest(
+    allocator,
+    client,
+    .GET,
+    "/orders/42?expand=items",
+    &std_headers,
+    .{ .transaction_name = "GET /orders/:id" },
     incomingHandler,
     handler_ctx,
     .{},

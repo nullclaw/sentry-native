@@ -390,6 +390,27 @@ const status = try sentry.integrations.auto.runIncomingRequestFromHeadersWithCur
 _ = status;
 ```
 
+`std.http` adapter variant:
+
+```zig
+const std_headers = [_]std.http.Header{
+    .{ .name = "traceparent", .value = incoming_traceparent_header },
+    .{ .name = "baggage", .value = incoming_baggage_header },
+};
+const status = try sentry.integrations.std_http.runIncomingRequest(
+    allocator,
+    client,
+    .GET,
+    "/orders/42?expand=items",
+    &std_headers,
+    .{ .transaction_name = "GET /orders/:id" },
+    incomingHandler,
+    handler_ctx,
+    .{},
+);
+_ = status;
+```
+
 ### Outgoing HTTP request integration helper
 
 Use `integrations.http.OutgoingRequestContext` inside an active transaction/span
