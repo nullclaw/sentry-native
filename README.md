@@ -142,7 +142,7 @@ jobs:
 | Scope enrichment | Implemented | User/tags/extras/contexts/breadcrumbs/fingerprint/transaction |
 | Attachments | Implemented | In-memory and file-backed attachments |
 | Transactions & spans | Implemented | Sampling + trace context serialization |
-| Event context bootstrap | Implemented | Captured events receive missing `contexts.trace` + runtime/os entries while preserving custom contexts |
+| Event context bootstrap | Implemented | Captured events receive missing `contexts.trace` + runtime/os/device entries while preserving custom contexts |
 | Transaction DSC envelope header | Implemented | Envelope header includes `trace_id/public_key/sample_rate/sampled` |
 | Trace propagation headers | Implemented | `sentry-trace`/`baggage` generation + continuation from trace value, header pairs, or explicit propagation headers |
 | Traces sampler callback | Implemented | `traces_sampler` has priority over `traces_sample_rate` |
@@ -726,7 +726,7 @@ All options are provided via `sentry.Options` in `sentry.init`.
 | `session_aggregate_flush_interval_ms` | `u64` | `60000` | Request-mode aggregate auto-flush interval (`0` disables timer flush) |
 | `shutdown_timeout_ms` | `u64` | `2000` | Timeout for shutdown flush |
 
-When `default_integrations = false`, automatic runtime/os context enrichment is disabled
+When `default_integrations = false`, automatic runtime/os/device context enrichment is disabled
 (trace context bootstrap remains enabled).
 `traces_sampler` receives `transaction_name`, `transaction_op`, `trace_id`, `span_id`,
 `parent_sampled`, and optional `custom_sampling_context` from `TransactionOpts`.

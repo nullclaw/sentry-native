@@ -225,6 +225,19 @@ fn buildDefaultTraceContexts(
         try putOwnedString(allocator, &os_object, "arch", @tagName(builtin.cpu.arch));
     }
 
+    var device_object: json.ObjectMap = undefined;
+    var device_moved = true;
+    if (include_runtime_os) {
+        device_object = json.ObjectMap.init(allocator);
+        device_moved = false;
+        errdefer if (!device_moved) {
+            var value: json.Value = .{ .object = device_object };
+            scope_mod.deinitJsonValueDeep(allocator, &value);
+        };
+        try putOwnedString(allocator, &device_object, "arch", @tagName(builtin.cpu.arch));
+        try putOwnedString(allocator, &device_object, "family", @tagName(builtin.os.tag));
+    }
+
     var contexts_object = json.ObjectMap.init(allocator);
     errdefer {
         var value: json.Value = .{ .object = contexts_object };
@@ -238,6 +251,8 @@ fn buildDefaultTraceContexts(
         runtime_moved = true;
         try putOwnedJsonEntry(allocator, &contexts_object, "os", .{ .object = os_object });
         os_moved = true;
+        try putOwnedJsonEntry(allocator, &contexts_object, "device", .{ .object = device_object });
+        device_moved = true;
     }
     return .{ .object = contexts_object };
 }
@@ -255,7 +270,8 @@ fn mergeDefaultTraceContexts(
     const need_trace = existing.get("trace") == null;
     const need_runtime = include_runtime_os and existing.get("runtime") == null;
     const need_os = include_runtime_os and existing.get("os") == null;
-    if (!need_trace and !need_runtime and !need_os) return null;
+    const need_device = include_runtime_os and existing.get("device") == null;
+    if (!need_trace and !need_runtime and !need_os and !need_device) return null;
 
     var merged = try scope_mod.cloneJsonValue(allocator, contexts);
     errdefer scope_mod.deinitJsonValueDeep(allocator, &merged);
@@ -296,6 +312,13 @@ fn mergeDefaultTraceContexts(
             try putOwnedJsonEntry(allocator, merged_object, "os", os_copy);
         }
     }
+    if (need_device) {
+        if (default_object.get("device")) |device_value| {
+            var device_copy = try scope_mod.cloneJsonValue(allocator, device_value);
+            errdefer scope_mod.deinitJsonValueDeep(allocator, &device_copy);
+            try putOwnedJsonEntry(allocator, merged_object, "device", device_copy);
+        }
+    }
 
     return merged;
 }
@@ -331,7 +354,7 @@ fn putOwnedBool(
     try putOwnedJsonEntry(allocator, object, key, .{ .bool = value });
 }
 
-test "ensureDefaultTraceContexts creates trace runtime and os when absent" {
+test "ensureDefaultTraceContexts creates trace runtime os and device when absent" {
     var event = Event.init();
     const propagation_context: scope_mod.PropagationContext = .{
         .trace_id = "0123456789abcdef0123456789abcdef".*,
@@ -356,10 +379,12 @@ test "ensureDefaultTraceContexts creates trace runtime and os when absent" {
     const trace = contexts.get("trace") orelse return error.TestUnexpectedResult;
     const runtime = contexts.get("runtime") orelse return error.TestUnexpectedResult;
     const os = contexts.get("os") orelse return error.TestUnexpectedResult;
+    const device = contexts.get("device") orelse return error.TestUnexpectedResult;
 
     try testing.expect(trace == .object);
     try testing.expect(runtime == .object);
     try testing.expect(os == .object);
+    try testing.expect(device == .object);
 
     const trace_obj = trace.object;
     try testing.expectEqualStrings(
@@ -426,6 +451,7 @@ test "ensureDefaultTraceContexts only fills missing defaults" {
     );
     try testing.expect(merged.get("runtime") != null);
     try testing.expect(merged.get("os") != null);
+    try testing.expect(merged.get("device") != null);
 }
 
 test "ensureDefaultTraceContexts returns null when defaults already present" {

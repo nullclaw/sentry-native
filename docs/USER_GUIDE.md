@@ -937,10 +937,10 @@ forces per-transaction sampling (`true` => rate `1.0`, `false` => rate `0.0`)
 and takes precedence over `TransactionOpts.sample_rate`.
 
 For regular event messages, the SDK automatically adds default contexts
-(`contexts.trace`, `contexts.runtime`, `contexts.os`) when trace context
+(`contexts.trace`, `contexts.runtime`, `contexts.os`, `contexts.device`) when trace context
 is missing in the input event.
 
-Set `default_integrations=false` to disable automatic `runtime`/`os` context enrichment.
+Set `default_integrations=false` to disable automatic `runtime`/`os`/`device` context enrichment.
 
 Set `in_app_include` / `in_app_exclude` to classify event, exception, and thread stack frames.
 Matching `in_app_include` patterns set `frame.in_app=true`, matching

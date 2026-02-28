@@ -3231,6 +3231,7 @@ fn hasDebugMetaImages(event: *const Event) bool {
 var before_send_saw_trace_context: bool = false;
 var before_send_saw_runtime_context: bool = false;
 var before_send_saw_os_context: bool = false;
+var before_send_saw_device_context: bool = false;
 var before_send_saw_threads: bool = false;
 var before_send_saw_debug_meta_images: bool = false;
 var before_send_debug_meta_custom_preserved: bool = false;
@@ -3264,6 +3265,7 @@ fn inspectTraceContextBeforeSend(event: *Event) ?*Event {
     before_send_saw_trace_context = hasTraceContext(event);
     before_send_saw_runtime_context = hasNamedContext(event, "runtime");
     before_send_saw_os_context = hasNamedContext(event, "os");
+    before_send_saw_device_context = hasNamedContext(event, "device");
     return event;
 }
 
@@ -3598,6 +3600,7 @@ test "Client captureMessage injects default trace context into event" {
     before_send_saw_trace_context = false;
     before_send_saw_runtime_context = false;
     before_send_saw_os_context = false;
+    before_send_saw_device_context = false;
 
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
@@ -3610,6 +3613,7 @@ test "Client captureMessage injects default trace context into event" {
     try testing.expect(before_send_saw_trace_context);
     try testing.expect(before_send_saw_runtime_context);
     try testing.expect(before_send_saw_os_context);
+    try testing.expect(before_send_saw_device_context);
 }
 
 test "Client captureMessage keeps a stable propagation trace context within scope" {
@@ -3699,6 +3703,7 @@ test "Client default_integrations false injects trace context without runtime or
     before_send_saw_trace_context = false;
     before_send_saw_runtime_context = false;
     before_send_saw_os_context = false;
+    before_send_saw_device_context = false;
 
     const client = try Client.init(testing.allocator, .{
         .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
@@ -3712,12 +3717,14 @@ test "Client default_integrations false injects trace context without runtime or
     try testing.expect(before_send_saw_trace_context);
     try testing.expect(!before_send_saw_runtime_context);
     try testing.expect(!before_send_saw_os_context);
+    try testing.expect(!before_send_saw_device_context);
 }
 
 test "Client merges default trace contexts into existing custom event contexts" {
     before_send_saw_trace_context = false;
     before_send_saw_runtime_context = false;
     before_send_saw_os_context = false;
+    before_send_saw_device_context = false;
 
     var contexts_object = json.ObjectMap.init(testing.allocator);
     defer {
@@ -3742,9 +3749,11 @@ test "Client merges default trace contexts into existing custom event contexts" 
     try testing.expect(before_send_saw_trace_context);
     try testing.expect(before_send_saw_runtime_context);
     try testing.expect(before_send_saw_os_context);
+    try testing.expect(before_send_saw_device_context);
     try testing.expect(contexts_object.get("trace") == null);
     try testing.expect(contexts_object.get("runtime") == null);
     try testing.expect(contexts_object.get("os") == null);
+    try testing.expect(contexts_object.get("device") == null);
 }
 
 test "Client fallback server_name is applied when option is unset" {
