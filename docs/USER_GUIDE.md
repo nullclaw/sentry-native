@@ -947,6 +947,8 @@ Matching `in_app_include` patterns set `frame.in_app=true`, matching
 `in_app_exclude` patterns set `frame.in_app=false`.
 With `default_integrations=true`, stacktrace frames are also classified even
 without explicit include/exclude patterns.
+Well-known runtime/library function prefixes (for example `std::`, `core::`,
+`tokio::`) are classified as `in_app=false`.
 If no frame in a stacktrace is marked `in_app=true`, frames without explicit
 `in_app` are treated as `true`.
 For transaction envelopes, the SDK adds a dynamic trace header

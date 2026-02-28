@@ -1449,7 +1449,38 @@ pub const Client = struct {
         if (in_app_exclude) |exclude_patterns| {
             if (matchFramePatterns(frame, exclude_patterns)) return false;
         }
+        if (isWellKnownNotInApp(frame)) return false;
         return null;
+    }
+
+    const well_known_not_in_app_prefixes = [_][]const u8{
+        "std::",
+        "core::",
+        "alloc::",
+        "backtrace::",
+        "sentry::",
+        "sentry_core::",
+        "sentry_types::",
+        "sentry_backtrace::",
+        "sentry_tracing::",
+        "__rust_",
+        "___rust_",
+        "rust_begin_unwind",
+        "_start",
+        "anyhow::",
+        "log::",
+        "tokio::",
+        "tracing_core::",
+        "futures_core::",
+        "futures_util::",
+    };
+
+    fn isWellKnownNotInApp(frame: Frame) bool {
+        const function = frame.function orelse return false;
+        for (well_known_not_in_app_prefixes) |prefix| {
+            if (std.mem.startsWith(u8, function, prefix)) return true;
+        }
+        return false;
     }
 
     fn matchFramePatterns(frame: Frame, patterns: []const []const u8) bool {
@@ -3788,6 +3819,28 @@ test "Client default integrations classify unresolved event stacktrace frames as
 
     try testing.expect(client.captureEventId(&event) != null);
     try testing.expectEqual(@as(?bool, true), before_send_first_event_stacktrace_frame_in_app);
+    try testing.expectEqual(@as(?bool, null), frames[0].in_app);
+}
+
+test "Client default integrations mark well-known runtime event stacktrace frames as in_app=false" {
+    before_send_first_event_stacktrace_frame_in_app = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = true,
+        .before_send = inspectEventStacktraceInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{.{
+        .function = "std::panicking::begin_panic",
+    }};
+    var event = Event.initMessage("event-stacktrace-well-known-runtime", .info);
+    event.stacktrace = .{ .frames = &frames };
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, false), before_send_first_event_stacktrace_frame_in_app);
     try testing.expectEqual(@as(?bool, null), frames[0].in_app);
 }
 
