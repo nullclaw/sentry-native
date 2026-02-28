@@ -1247,6 +1247,8 @@ pub const Client = struct {
                     if (ensureFramePackageFromFunction(frame)) {
                         any_modified = true;
                     }
+                    if (frame.function == null) continue;
+
                     if (frame.in_app) |in_app| {
                         if (in_app) stacktrace_has_in_app = true;
                         continue;
@@ -1310,6 +1312,8 @@ pub const Client = struct {
             if (ensureFramePackageFromFunction(frame)) {
                 any_modified = true;
             }
+            if (frame.function == null) continue;
+
             if (frame.in_app) |in_app| {
                 if (in_app) stacktrace_has_in_app = true;
                 continue;
@@ -1372,6 +1376,8 @@ pub const Client = struct {
                 if (try ensureThreadFramePackage(allocator, &frame_value.object)) {
                     any_modified = true;
                 }
+                const function = jsonStringField(frame_value.object.get("function")) orelse continue;
+                _ = function;
 
                 const existing_in_app = frame_value.object.getPtr("in_app");
                 if (existing_in_app) |in_app_ptr| {
@@ -3138,6 +3144,20 @@ fn firstEventStacktraceFrameInApp(event: *const Event) ?bool {
     return stacktrace.frames[0].in_app;
 }
 
+fn secondEventStacktraceFrameInApp(event: *const Event) ?bool {
+    const stacktrace = event.stacktrace orelse return null;
+    if (stacktrace.frames.len < 2) return null;
+    return stacktrace.frames[1].in_app;
+}
+
+fn secondExceptionFrameInApp(event: *const Event) ?bool {
+    const exception = event.exception orelse return null;
+    if (exception.values.len == 0) return null;
+    const stacktrace = exception.values[0].stacktrace orelse return null;
+    if (stacktrace.frames.len < 2) return null;
+    return stacktrace.frames[1].in_app;
+}
+
 fn firstExceptionFramePackage(event: *const Event) ?[]const u8 {
     const exception = event.exception orelse return null;
     if (exception.values.len == 0) return null;
@@ -3194,6 +3214,8 @@ var before_send_debug_meta_custom_preserved: bool = false;
 var before_send_first_frame_in_app: ?bool = null;
 var before_send_first_thread_frame_in_app: ?bool = null;
 var before_send_first_event_stacktrace_frame_in_app: ?bool = null;
+var before_send_second_exception_frame_in_app: ?bool = null;
+var before_send_second_event_stacktrace_frame_in_app: ?bool = null;
 var expected_frame_package: ?[]const u8 = null;
 var before_send_exception_frame_package_matches_expected: bool = false;
 var before_send_event_stacktrace_frame_package_matches_expected: bool = false;
@@ -3290,6 +3312,7 @@ fn inspectMergedDebugMetaBeforeSend(event: *Event) ?*Event {
 
 fn inspectInAppBeforeSend(event: *Event) ?*Event {
     before_send_first_frame_in_app = null;
+    before_send_second_exception_frame_in_app = secondExceptionFrameInApp(event);
     before_send_exception_frame_package_matches_expected = false;
     if (event.exception) |exception| {
         if (exception.values.len > 0) {
@@ -3321,6 +3344,7 @@ fn inspectThreadInAppBeforeSend(event: *Event) ?*Event {
 
 fn inspectEventStacktraceInAppBeforeSend(event: *Event) ?*Event {
     before_send_first_event_stacktrace_frame_in_app = firstEventStacktraceFrameInApp(event);
+    before_send_second_event_stacktrace_frame_in_app = secondEventStacktraceFrameInApp(event);
     before_send_event_stacktrace_frame_package_matches_expected = false;
     if (expected_frame_package) |expected| {
         if (firstEventStacktraceFramePackage(event)) |package| {
@@ -3986,6 +4010,33 @@ test "Client in_app fallback marks exception frames as true when no frame is in_
     try testing.expectEqual(@as(?bool, null), frames[0].in_app);
 }
 
+test "Client fallback ignores in_app=true on exception frame without function and still resolves other frames" {
+    before_send_second_exception_frame_in_app = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = true,
+        .before_send = inspectInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{
+        .{ .in_app = true },
+        .{ .function = "vendor::lib::dispatch" },
+    };
+    const values = [_]ExceptionValue{.{
+        .type = "VendorError",
+        .value = "timeout",
+        .stacktrace = Stacktrace{ .frames = &frames },
+    }};
+    var event = Event.initException(&values);
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, true), before_send_second_exception_frame_in_app);
+    try testing.expectEqual(@as(?bool, null), frames[1].in_app);
+}
+
 test "Client in_app fallback marks thread frames as true when no frame is in_app" {
     before_send_first_thread_frame_in_app = null;
 
@@ -4143,6 +4194,29 @@ test "Client in_app fallback marks event stacktrace frames as true when unresolv
     try testing.expect(client.captureEventId(&event) != null);
     try testing.expectEqual(@as(?bool, true), before_send_first_event_stacktrace_frame_in_app);
     try testing.expectEqual(@as(?bool, null), frames[0].in_app);
+}
+
+test "Client fallback ignores in_app=true on event frame without function and still resolves other frames" {
+    before_send_second_event_stacktrace_frame_in_app = null;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .default_integrations = true,
+        .before_send = inspectEventStacktraceInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{
+        .{ .in_app = true },
+        .{ .function = "vendor::lib::runtime::dispatch" },
+    };
+    var event = Event.initMessage("event-stacktrace-no-func-in-app", .info);
+    event.stacktrace = .{ .frames = &frames };
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, true), before_send_second_event_stacktrace_frame_in_app);
+    try testing.expectEqual(@as(?bool, null), frames[1].in_app);
 }
 
 test "Client default integrations classify unresolved event stacktrace frames as in_app=true" {
