@@ -501,6 +501,12 @@ pub const Client = struct {
             prepared_event.exception = null;
         };
 
+        var owned_event_stacktrace_frames: ?[]Frame = null;
+        defer if (owned_event_stacktrace_frames) |frames| {
+            self.allocator.free(frames);
+            prepared_event.stacktrace = null;
+        };
+
         var owned_in_app_threads: ?json.Value = null;
         defer if (owned_in_app_threads) |*threads| {
             scope_mod.deinitJsonValueDeep(self.allocator, threads);
@@ -515,6 +521,14 @@ pub const Client = struct {
                 self.options.in_app_exclude,
             ) catch null) |ownership| {
                 owned_exception_frames = ownership;
+            }
+            if (applyInAppEventStacktraceHints(
+                self.allocator,
+                prepared_event,
+                self.options.in_app_include,
+                self.options.in_app_exclude,
+            ) catch null) |frames| {
+                owned_event_stacktrace_frames = frames;
             }
             if (applyInAppThreadFrameHints(
                 self.allocator,
@@ -549,7 +563,7 @@ pub const Client = struct {
             prepared_event.threads = null;
         };
 
-        if (self.options.attach_stacktrace and prepared_event.threads == null) {
+        if (self.options.attach_stacktrace and !eventHasAnyStacktrace(prepared_event)) {
             const threads = event_enrichment_mod.buildSyntheticThreads(self.allocator) catch null;
             if (threads) |value| {
                 prepared_event.threads = value;
@@ -1271,6 +1285,50 @@ pub const Client = struct {
         };
     }
 
+    fn applyInAppEventStacktraceHints(
+        allocator: Allocator,
+        event: *Event,
+        in_app_include: ?[]const []const u8,
+        in_app_exclude: ?[]const []const u8,
+    ) !?[]Frame {
+        const stacktrace = event.stacktrace orelse return null;
+        if (stacktrace.frames.len == 0) return null;
+
+        const frames_copy = try allocator.alloc(Frame, stacktrace.frames.len);
+        @memcpy(frames_copy, stacktrace.frames);
+
+        var any_modified = false;
+        var stacktrace_has_in_app = false;
+        for (frames_copy) |*frame| {
+            if (frame.in_app) |in_app| {
+                if (in_app) stacktrace_has_in_app = true;
+                continue;
+            }
+            if (inferInApp(frame.*, in_app_include, in_app_exclude)) |in_app| {
+                frame.in_app = in_app;
+                any_modified = true;
+                if (in_app) stacktrace_has_in_app = true;
+            }
+        }
+
+        if (!stacktrace_has_in_app) {
+            for (frames_copy) |*frame| {
+                if (frame.in_app == null) {
+                    frame.in_app = true;
+                    any_modified = true;
+                }
+            }
+        }
+
+        if (!any_modified) {
+            allocator.free(frames_copy);
+            return null;
+        }
+
+        event.stacktrace = .{ .frames = frames_copy };
+        return frames_copy;
+    }
+
     fn applyInAppThreadFrameHints(
         allocator: Allocator,
         event: *Event,
@@ -1416,6 +1474,35 @@ pub const Client = struct {
             return exception.values.len > 0;
         }
         return false;
+    }
+
+    fn hasAnyExceptionStacktrace(event: *const Event) bool {
+        const exception = event.exception orelse return false;
+        for (exception.values) |value| {
+            if (value.stacktrace != null) return true;
+        }
+        return false;
+    }
+
+    fn hasAnyThreadStacktrace(event: *const Event) bool {
+        const threads = event.threads orelse return false;
+        if (threads != .object) return false;
+
+        const values = threads.object.get("values") orelse return false;
+        if (values != .array) return false;
+
+        for (values.array.items) |thread_value| {
+            if (thread_value != .object) continue;
+            const stacktrace = thread_value.object.get("stacktrace") orelse continue;
+            if (stacktrace == .object) return true;
+        }
+        return false;
+    }
+
+    fn eventHasAnyStacktrace(event: *const Event) bool {
+        if (event.stacktrace != null) return true;
+        if (hasAnyExceptionStacktrace(event)) return true;
+        return hasAnyThreadStacktrace(event);
     }
 
     fn putOwnedJsonEntry(
@@ -2836,19 +2923,7 @@ fn hasNamedContext(event: *const Event, name: []const u8) bool {
 }
 
 fn hasThreadStacktrace(event: *const Event) bool {
-    if (event.threads) |threads| {
-        switch (threads) {
-            .object => |obj| {
-                const values = obj.get("values") orelse return false;
-                return switch (values) {
-                    .array => |arr| arr.items.len > 0,
-                    else => false,
-                };
-            },
-            else => return false,
-        }
-    }
-    return false;
+    return Client.hasAnyThreadStacktrace(event);
 }
 
 fn firstThreadFrameInApp(event: *const Event) ?bool {
@@ -2874,6 +2949,12 @@ fn firstThreadFrameInApp(event: *const Event) ?bool {
     };
 }
 
+fn firstEventStacktraceFrameInApp(event: *const Event) ?bool {
+    const stacktrace = event.stacktrace orelse return null;
+    if (stacktrace.frames.len == 0) return null;
+    return stacktrace.frames[0].in_app;
+}
+
 fn hasDebugMetaImages(event: *const Event) bool {
     const debug_meta = event.debug_meta orelse return false;
     if (debug_meta != .object) return false;
@@ -2892,6 +2973,7 @@ var before_send_saw_debug_meta_images: bool = false;
 var before_send_debug_meta_custom_preserved: bool = false;
 var before_send_first_frame_in_app: ?bool = null;
 var before_send_first_thread_frame_in_app: ?bool = null;
+var before_send_first_event_stacktrace_frame_in_app: ?bool = null;
 var before_send_observed_server_name: ?[]const u8 = null;
 var before_send_observed_dist: ?[]const u8 = null;
 var before_send_observed_platform: ?[]const u8 = null;
@@ -2998,6 +3080,11 @@ fn inspectInAppBeforeSend(event: *Event) ?*Event {
 
 fn inspectThreadInAppBeforeSend(event: *Event) ?*Event {
     before_send_first_thread_frame_in_app = firstThreadFrameInApp(event);
+    return event;
+}
+
+fn inspectEventStacktraceInAppBeforeSend(event: *Event) ?*Event {
+    before_send_first_event_stacktrace_frame_in_app = firstEventStacktraceFrameInApp(event);
     return event;
 }
 
@@ -3627,6 +3714,75 @@ test "Client in_app fallback marks thread frames as true when no frame is in_app
     try testing.expect(client.captureEventId(&event) != null);
     try testing.expectEqual(@as(?bool, true), before_send_first_thread_frame_in_app);
     try testing.expectEqual(@as(?bool, null), firstThreadFrameInApp(&event));
+}
+
+test "Client in_app_include marks matching event stacktrace frames without mutating input event" {
+    before_send_first_event_stacktrace_frame_in_app = null;
+
+    const include_patterns = [_][]const u8{"my.app"};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .in_app_include = &include_patterns,
+        .before_send = inspectEventStacktraceInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{.{
+        .module = "my.app.entry",
+        .function = "execute",
+    }};
+    var event = Event.initMessage("event-stacktrace-include", .info);
+    event.stacktrace = .{ .frames = &frames };
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, true), before_send_first_event_stacktrace_frame_in_app);
+    try testing.expectEqual(@as(?bool, null), frames[0].in_app);
+}
+
+test "Client in_app fallback marks event stacktrace frames as true when unresolved" {
+    before_send_first_event_stacktrace_frame_in_app = null;
+
+    const include_patterns = [_][]const u8{"my.app"};
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .in_app_include = &include_patterns,
+        .before_send = inspectEventStacktraceInAppBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{.{
+        .module = "vendor.lib.runtime",
+        .function = "dispatch",
+    }};
+    var event = Event.initMessage("event-stacktrace-fallback", .info);
+    event.stacktrace = .{ .frames = &frames };
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expectEqual(@as(?bool, true), before_send_first_event_stacktrace_frame_in_app);
+    try testing.expectEqual(@as(?bool, null), frames[0].in_app);
+}
+
+test "Client attach_stacktrace does not inject threads when event stacktrace already exists" {
+    before_send_saw_threads = false;
+
+    const client = try Client.init(testing.allocator, .{
+        .dsn = "https://examplePublicKey@o0.ingest.sentry.io/1234567",
+        .attach_stacktrace = true,
+        .before_send = inspectThreadsBeforeSend,
+        .install_signal_handlers = false,
+    });
+    defer client.deinit();
+
+    const frames = [_]Frame{.{
+        .function = "already-captured",
+    }};
+    var event = Event.initMessage("stacktrace-present", .warning);
+    event.stacktrace = .{ .frames = &frames };
+
+    try testing.expect(client.captureEventId(&event) != null);
+    try testing.expect(!before_send_saw_threads);
 }
 
 test "Client attach_stacktrace adds synthetic thread stacktrace data" {

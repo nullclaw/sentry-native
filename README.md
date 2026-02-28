@@ -701,7 +701,7 @@ All options are provided via `sentry.Options` in `sentry.init`.
 | `traces_sample_rate` | `f64` | `0.0` | Trace sampling (`0.0..1.0`) |
 | `traces_sampler` | `?TracesSampler` | `null` | Per-transaction sampling callback |
 | `max_breadcrumbs` | `u32` | `100` | Scope breadcrumb cap |
-| `attach_stacktrace` | `bool` | `false` | Attach current-thread stacktrace payload (with safe fallback) when event has no threads |
+| `attach_stacktrace` | `bool` | `false` | Attach current-thread stacktrace payload (with safe fallback) only when event has no stacktrace payload (`event`/`exception`/`threads`) |
 | `attach_debug_images` | `bool` | `true` | Attach default `debug_meta.images` payload when event has no debug image metadata |
 | `send_default_pii` | `bool` | `false` | Reserved option for explicit PII policy toggles |
 | `in_app_include` | `?[]const []const u8` | `null` | Optional in-app include patterns for stack frame classification |
@@ -736,7 +736,7 @@ sampling (`true` => `1.0`, `false` => `0.0`) and overrides
 Structured log records automatically include default `sentry.environment`,
 `sentry.release`, and `server.address` attributes when configured.
 When `server_name` is unset and `default_integrations = true`, the SDK attempts to use the local hostname.
-`in_app_include`/`in_app_exclude` are applied to exception and thread stack frames.
+`in_app_include`/`in_app_exclude` are applied to event, exception, and thread stack frames.
 When no frame is marked `in_app=true`, frames with missing `in_app` are treated as `true`.
 `attach_debug_images=true` injects default `debug_meta.images` metadata for events that do not already include debug image info.
 `accept_invalid_certs=true` is intended for local/dev environments and is not supported together with explicit proxy transport.

@@ -98,6 +98,7 @@ pub const Event = struct {
     transaction: ?[]const u8 = null,
     message: ?Message = null,
     exception: ?ExceptionInterface = null,
+    stacktrace: ?Stacktrace = null,
     threads: ?json.Value = null,
     tags: ?json.Value = null,
     extra: ?json.Value = null,
